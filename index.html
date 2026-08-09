@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>पोर्टल डैशबोर्ड - मुख्य द्वार</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f4f7f6;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+        .login-container {
+            background: #ffffff;
+            padding: 40px;
+            border-radius: 10px;
+            box-shadow: 0px 4px 15px rgba(0, 0, 0, 0.1);
+            width: 100%;
+            max-width: 400px;
+            text-align: center;
+        }
+        h2 {
+            color: #333333;
+            margin-bottom: 25px;
+        }
+        .portal-btn {
+            display: block;
+            width: 100%;
+            padding: 12px;
+            margin: 15px 0;
+            background-color: #007BFF;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            font-size: 16px;
+            font-weight: bold;
+            text-decoration: none;
+            cursor: pointer;
+            transition: background 0.3s ease;
+            box-sizing: border-box;
+        }
+        .portal-btn:hover {
+            background-color: #0056b3;
+        }
+        .admin-btn {
+            background-color: #28a745;
+        }
+        .admin-btn:hover {
+            background-color: #218838;
+        }
+        .hr-btn {
+            background-color: #17a2b8;
+        }
+        .hr-btn:hover {
+            background-color: #138496;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="login-container">
+        <h2>सिस्टम पोर्टल लॉगिन</h2>
+        <p style="color: #666; margin-bottom: 20px;">कृपया अपने अनुभाग का चयन करें</p>
+
+        <!-- 1. एजेंट लॉगिन और रजिस्ट्रेशन का रास्ता -->
+        <a href="Agent_login_2.html" class="portal-btn">एजेंट पोर्टल (Login / Register)</a>
+
+        <!-- 2. एडमिन पैनल लॉगिन का रास्ता -->
+        <a href="Admin_panel_fixed.html" class="portal-btn admin-btn">एडमिन पैनल लॉगिन</a>
+
+        <!-- 3. HRMS पोर्टल का रास्ता -->
+        <a href="HRMS_Portal.html" class="portal-btn hr-btn">HRMS पोर्टल</a>
+
+        <!-- 4. स्टूडेंट/अटेंडेंस पोर्टल का रास्ता (यदि जरूरत हो) -->
+        <a href="Student_Attendance_Portal.html" class="portal-btn" style="background-color: #6c757d;">अटेंडेंस पोर्टल</a>
+    </div>
+
+</body>
+</html>
