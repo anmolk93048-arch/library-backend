@@ -40,21 +40,34 @@ function getAuthUser(req) {
    Database Connection (Cloud SQL & MySQL 8.4 Compatible)
 -------------------------------------------------------------------------- */
 const db = mysql.createPool({
-    host: process.env.DB_HOST || '8.234.64.212',                // Cloud SQL Public IP
-    user: process.env.DB_USER || 'free-trial-first-project',    // Updated DB User
-    password: process.env.DB_PASSWORD || 'Anmol@2003',          // DB Password
-    database: process.env.DB_NAME || 'anmol_portal_ab',         // DB Name
+    host: process.env.DB_HOST,                 // Cloud SQL Public IP — Render Environment se aayega
+    user: process.env.DB_USER,                  // DB User — Render Environment se aayega
+    password: process.env.DB_PASSWORD,           // DB Password — Render Environment se aayega
+    database: process.env.DB_NAME,               // DB Name — Render Environment se aayega
     waitForConnections: true,
     connectionLimit: 10,
     ssl: {
         rejectUnauthorized: false
     },
     authPlugins: {
-        mysql_clear_password: () => () => Buffer.from('Anmol@2003')
+        mysql_clear_password: () => () => Buffer.from(process.env.DB_PASSWORD || '')
     }
 });
 
-const JWT_SECRET = process.env.JWT_SECRET || 'anmol_super_secret_jwt_key_2026';
+const JWT_SECRET = process.env.JWT_SECRET;
+
+// 🔒 SECURITY: pehle DB password aur JWT secret seedhe code mein likhe the
+// (agar yeh code kabhi public GitHub repo mein hota, to password sabko dikh
+// jaata). Ab sab kuch sirf Render ke Environment Variables se aata hai —
+// koi bhi secret ab is file mein kahin nahi likha. Agar zaroori variable
+// missing ho, to server turant clearly bata dega (chup-chaap galat/khaali
+// credential se connect karne ki koshish nahi karega).
+const REQUIRED_ENV = ['DB_HOST', 'DB_USER', 'DB_PASSWORD', 'DB_NAME', 'JWT_SECRET'];
+const missingEnv = REQUIRED_ENV.filter(k => !process.env[k]);
+if (missingEnv.length) {
+    console.error('❌ Yeh zaroori Environment Variables Render Dashboard mein set nahi hain: ' + missingEnv.join(', '));
+    console.error('   Render → apni service → Environment tab mein jaakar inhe add karein, warna DB/login features kaam nahi karenge.');
+}
 
 // Test Database Connection & Tables Setup
 db.getConnection((err, connection) => {
@@ -571,19 +584,121 @@ app.get('/api/payments/fee', (req, res) => {
     });
 });
 
-// Razorpay order/verify — NOTE: yeh basic scaffold hai. Asli payment lene ke
-// liye Render ke Environment mein RAZORPAY_KEY_ID aur RAZORPAY_KEY_SECRET
-// add karein aur npm install razorpay karke uske SDK se order banayein.
-// Abhi yeh sirf ek mock order-id deta hai taaki UI 404 pe na atke.
-app.post('/api/payments/razorpay/order', (req, res) => {
-    if (!process.env.RAZORPAY_KEY_ID) {
-        return res.status(501).json({ error: 'Razorpay keys Render Environment mein set nahi hain (RAZORPAY_KEY_ID/SECRET).' });
+// ══════════════════════════════════════════════════════════════════
+// 💳 RAZORPAY — order create + payment verify
+//   Keys kabhi bhi code mein nahi likhi jaatin — dono Render Dashboard ke
+//   Environment Variables se aati hain:
+//     PAYMENT_API_KEY    → Razorpay "Key ID"
+//     PAYMENT_API_SECRET → Razorpay "Key Secret"
+//   (Node ke built-in 'https'/'crypto' se hi kaam chal jaata hai, isliye
+//   koi naya npm package install karne ki zaroorat nahi.)
+// ══════════════════════════════════════════════════════════════════
+const https = require('https');
+const crypto = require('crypto');
+
+function razorpayRequest(path, body) {
+    return new Promise((resolve, reject) => {
+        const key = process.env.PAYMENT_API_KEY;
+        const secret = process.env.PAYMENT_API_SECRET;
+        if (!key || !secret) return reject(new Error('PAYMENT_API_KEY / PAYMENT_API_SECRET Render Environment mein set nahi hain.'));
+        const payload = JSON.stringify(body);
+        const options = {
+            hostname: 'api.razorpay.com',
+            path,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(payload),
+                'Authorization': 'Basic ' + Buffer.from(key + ':' + secret).toString('base64')
+            }
+        };
+        const reqStream = https.request(options, (resp) => {
+            let data = '';
+            resp.on('data', (chunk) => { data += chunk; });
+            resp.on('end', () => {
+                try {
+                    const parsed = JSON.parse(data);
+                    if (resp.statusCode >= 200 && resp.statusCode < 300) resolve(parsed);
+                    else reject(new Error(parsed.error ? parsed.error.description : 'Razorpay API error'));
+                } catch (e) { reject(e); }
+            });
+        });
+        reqStream.on('error', reject);
+        reqStream.write(payload);
+        reqStream.end();
+    });
+}
+
+app.post('/api/payments/razorpay/order', async (req, res) => {
+    if (!process.env.PAYMENT_API_KEY || !process.env.PAYMENT_API_SECRET) {
+        return res.status(501).json({ error: 'Payment keys Render Environment mein set nahi hain (PAYMENT_API_KEY / PAYMENT_API_SECRET).' });
     }
-    // Yahan asli Razorpay SDK se order banega (Razorpay instance + orders.create)
-    res.status(501).json({ error: 'Razorpay integration abhi complete nahi hai — SDK setup baaki hai.' });
+    const { amount, currency, receipt } = req.body || {};
+    if (!(amount > 0)) return res.status(400).json({ error: 'Sahi amount bhejein.' });
+    try {
+        const order = await razorpayRequest('/v1/orders', {
+            amount: Math.round(amount * 100), // paise mein
+            currency: currency || 'INR',
+            receipt: receipt || ('rcpt_' + Date.now())
+        });
+        res.json({ orderId: order.id, amount: order.amount, currency: order.currency, key: process.env.PAYMENT_API_KEY });
+    } catch (e) {
+        res.status(502).json({ error: 'Razorpay order banane mein error: ' + e.message });
+    }
 });
+
 app.post('/api/payments/razorpay/verify', (req, res) => {
-    res.status(501).json({ error: 'Razorpay integration abhi complete nahi hai — SDK setup baaki hai.' });
+    const secret = process.env.PAYMENT_API_SECRET;
+    if (!secret) return res.status(501).json({ error: 'PAYMENT_API_SECRET Render Environment mein set nahi hai.' });
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+        return res.status(400).json({ error: 'Order ID, Payment ID aur Signature teeno zaroori hain.' });
+    }
+    const expected = crypto.createHmac('sha256', secret)
+        .update(razorpay_order_id + '|' + razorpay_payment_id)
+        .digest('hex');
+    if (expected !== razorpay_signature) {
+        return res.status(400).json({ error: 'Payment verify nahi hua — signature match nahi hui.' });
+    }
+    res.json({ success: true });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 📱 SMS — OTP/notification bhejne ke liye. Key kabhi code mein nahi —
+//   Render Environment se aati hai: SMS_API_KEY (+ optional SMS_SENDER_ID).
+//   Neeche wala provider URL ek generic placeholder hai (Fast2SMS jaisa
+//   pattern) — apne asli SMS provider (Fast2SMS/MSG91/Twilio/etc) ke
+//   hisaab se path/params thoda badalna pad sakta hai.
+// ══════════════════════════════════════════════════════════════════
+function sendSms(mobile, message) {
+    return new Promise((resolve, reject) => {
+        const apiKey = process.env.SMS_API_KEY;
+        if (!apiKey) return reject(new Error('SMS_API_KEY Render Environment mein set nahi hai.'));
+        const params = new URLSearchParams({
+            authorization: apiKey,
+            route: 'q',
+            message,
+            numbers: mobile,
+            sender_id: process.env.SMS_SENDER_ID || 'LIBRBK'
+        });
+        https.get('https://www.fast2sms.com/dev/bulkV2?' + params.toString(), (resp) => {
+            let data = '';
+            resp.on('data', (c) => { data += c; });
+            resp.on('end', () => resolve(data));
+        }).on('error', reject);
+    });
+}
+
+app.post('/api/sms/send', async (req, res) => {
+    const { mobile, message } = req.body || {};
+    if (!mobile || !message) return res.status(400).json({ error: 'mobile aur message zaroori hain.' });
+    if (!process.env.SMS_API_KEY) return res.status(501).json({ error: 'SMS_API_KEY Render Environment mein set nahi hai.' });
+    try {
+        await sendSms(mobile, message);
+        res.json({ success: true });
+    } catch (e) {
+        res.status(502).json({ error: 'SMS bhejne mein error: ' + e.message });
+    }
 });
 
 // Agent student-collect transaction (create → pending; HRMS verify/reject)
