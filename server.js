@@ -19,6 +19,23 @@ app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ limit: '25mb', extended: true }));
 app.use(express.static('.'));
 
+// ── Auth helper: '/auth/login' se mila JWT token decode karke
+//   req.user = { role, username } set karta hai. Token na ho / invalid ho
+//   to bhi request block nahi hoti (kai routes public/self-verifying hain
+//   jaisa Student_Attendance.html ke comment mein likha hai) — bas
+//   req.user null rehta hai. Wallet jaise identity-based routes username
+//   ko hi agentId/staffId ki tarah use karte hain. ──
+function getAuthUser(req) {
+    try {
+        const h = req.headers.authorization || '';
+        const token = h.startsWith('Bearer ') ? h.slice(7) : null;
+        if (!token) return null;
+        return jwt.verify(token, JWT_SECRET);
+    } catch (e) {
+        return null;
+    }
+}
+
 /* --------------------------------------------------------------------------
    Database Connection (Cloud SQL & MySQL 8.4 Compatible)
 -------------------------------------------------------------------------- */
@@ -104,7 +121,139 @@ db.getConnection((err, connection) => {
         `;
         connection.query(createMaterialUsersTable, (tableErr) => {
             if (tableErr) console.error('❌ material_users table error:', tableErr.message);
+        });
+
+        // 🆕 Material bills/invoices (Anmol_material_entry_secure.html)
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS material_bills (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                ownerUserId VARCHAR(50) NOT NULL,
+                data LONGTEXT,
+                savedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `, (e) => { if (e) console.error('❌ material_bills table error:', e.message); });
+
+        // 🆕 Generic key-value stores — admin-entities (admins/staff/agents/students
+        // arrays) aur blob (settings/notices/mem_plans/... — routes/blob.js jaisa)
+        // aur site-data (site content JSON). Frontend hamesha poori array/object
+        // ek saath bhejta-padta hai, isliye ek generic table kaafi hai.
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS kv_admin_entities (
+                \`key\` VARCHAR(100) PRIMARY KEY,
+                value LONGTEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            )
+        `, (e) => { if (e) console.error('❌ kv_admin_entities table error:', e.message); });
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS kv_blob (
+                \`key\` VARCHAR(100) PRIMARY KEY,
+                value LONGTEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            )
+        `, (e) => { if (e) console.error('❌ kv_blob table error:', e.message); });
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS kv_site_data (
+                \`key\` VARCHAR(100) PRIMARY KEY,
+                value LONGTEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            )
+        `, (e) => { if (e) console.error('❌ kv_site_data table error:', e.message); });
+
+        // 🆕 Attendance (date+batch pe keyed merge — Student_Attendance.html)
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS attendance_records (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                date VARCHAR(20) NOT NULL,
+                batch VARCHAR(20) NOT NULL,
+                records LONGTEXT,
+                selfies LONGTEXT,
+                markedBy VARCHAR(255),
+                savedAt VARCHAR(50),
+                UNIQUE KEY date_batch (date, batch)
+            )
+        `, (e) => { if (e) console.error('❌ attendance_records table error:', e.message); });
+
+        // 🆕 Student fee payments
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS fee_payments (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                studentId VARCHAR(100) NOT NULL,
+                amount DECIMAL(10,2) NOT NULL,
+                mode VARCHAR(50),
+                note VARCHAR(500),
+                status VARCHAR(20) DEFAULT 'paid',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `, (e) => { if (e) console.error('❌ fee_payments table error:', e.message); });
+
+        // 🆕 Student → Agent direct-collect transactions (HRMS verify/reject flow)
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS transactions (
+                id VARCHAR(50) PRIMARY KEY,
+                agentId VARCHAR(100),
+                studentId VARCHAR(100),
+                amount DECIMAL(10,2) NOT NULL,
+                status VARCHAR(20) DEFAULT 'pending',
+                reason VARCHAR(500),
+                data LONGTEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `, (e) => { if (e) console.error('❌ transactions table error:', e.message); });
+
+        // 🆕 HRMS salary slips (admin-generated) + claims (staff self-submitted)
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS hrms_salary_slips (
+                id VARCHAR(50) PRIMARY KEY,
+                empId VARCHAR(100),
+                data LONGTEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `, (e) => { if (e) console.error('❌ hrms_salary_slips table error:', e.message); });
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS hrms_salary_claims (
+                id VARCHAR(50) PRIMARY KEY,
+                empId VARCHAR(100),
+                status VARCHAR(30) DEFAULT 'pending',
+                agentId VARCHAR(100),
+                netAmount DECIMAL(10,2),
+                data LONGTEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `, (e) => { if (e) console.error('❌ hrms_salary_claims table error:', e.message); });
+
+        // 🆕 Agent wallets + withdrawals + direct payments
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS agent_wallets (
+                agentId VARCHAR(100) PRIMARY KEY,
+                approved_balance DECIMAL(12,2) DEFAULT 0,
+                pending_balance DECIMAL(12,2) DEFAULT 0,
+                total_earned DECIMAL(12,2) DEFAULT 0
+            )
+        `, (e) => { if (e) console.error('❌ agent_wallets table error:', e.message); });
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS wallet_withdrawals (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                agentId VARCHAR(100) NOT NULL,
+                agentName VARCHAR(255),
+                amount DECIMAL(10,2) NOT NULL,
+                accName VARCHAR(255), bankName VARCHAR(255), accNo VARCHAR(50), ifsc VARCHAR(20),
+                status VARCHAR(20) DEFAULT 'pending',
+                reason VARCHAR(500),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `, (e) => { if (e) console.error('❌ wallet_withdrawals table error:', e.message); });
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS wallet_direct_payments (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                agentId VARCHAR(100) NOT NULL,
+                amount DECIMAL(10,2) NOT NULL,
+                note VARCHAR(500),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `, (e) => {
+            if (e) console.error('❌ wallet_direct_payments table error:', e.message);
             connection.release();
+            console.log('✅ Saari tables ready — koi bhi feature ab 404 nahi dega.');
         });
     }
 });
@@ -274,6 +423,434 @@ app.post('/api/material/login', (req, res) => {
         const { password_hash, ...userSafe } = u;
         userSafe._docId = String(u.id);
         res.json({ user: userSafe, token });
+    });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 🔐 AUTH BRIDGE — Admin/Agent/Student login khud client-side (Firebase
+//   data ke against) hota hai; yeh route sirf ek session token deta hai
+//   taaki wallet/salary jaisi identity-based routes kaam kar sakein.
+// ══════════════════════════════════════════════════════════════════
+app.post('/api/auth/login', (req, res) => {
+    const { role, username } = req.body || {};
+    if (!role || !username) return res.status(400).json({ error: 'role aur username zaroori hain.' });
+    const token = jwt.sign({ role, username }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 🗄️ GENERIC KEY-VALUE STORES — admin-entities / blob / site-data
+//   (Admin Panel ke FBSync.pull/push isi se judte hain)
+// ══════════════════════════════════════════════════════════════════
+const ENTITY_KEYS = ['admins', 'staff', 'agents', 'students'];
+const BLOB_KEYS = ['settings', 'activity', 'notices', 'mem_plans', 'members',
+    'hrms_registrations', 'staff_att', 'leave_requests', 'agent_plans', 'agent_payments',
+    'razorpay_config', 'sms_api_config'];
+
+function kvGet(table, key, res, wrapValue) {
+    db.query(`SELECT value FROM ${table} WHERE \`key\` = ?`, [key], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!rows || !rows.length) return res.json(wrapValue ? null : null);
+        let parsed = null;
+        try { parsed = JSON.parse(rows[0].value); } catch (e) { parsed = rows[0].value; }
+        res.json(parsed);
+    });
+}
+function kvSet(table, key, value, res) {
+    const json = JSON.stringify(value);
+    db.query(
+        `INSERT INTO ${table} (\`key\`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = ?`,
+        [key, json, json],
+        (err) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            res.json({ success: true });
+        }
+    );
+}
+
+app.get('/api/admin-entities/:key', (req, res) => {
+    if (!ENTITY_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown entity key' });
+    kvGet('kv_admin_entities', req.params.key, res);
+});
+app.post('/api/admin-entities/:key', (req, res) => {
+    if (!ENTITY_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown entity key' });
+    kvSet('kv_admin_entities', req.params.key, req.body, res);
+});
+
+app.get('/api/blob/:key', (req, res) => {
+    if (!BLOB_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown blob key' });
+    kvGet('kv_blob', req.params.key, res);
+});
+app.post('/api/blob/:key', (req, res) => {
+    if (!BLOB_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown blob key' });
+    kvSet('kv_blob', req.params.key, req.body, res);
+});
+app.delete('/api/blob/:key', (req, res) => {
+    db.query('DELETE FROM kv_blob WHERE `key` = ?', [req.params.key], (err) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json({ success: true });
+    });
+});
+
+// site-data: POST body { value }, GET returns { value }
+app.post('/api/site-data/:key', (req, res) => {
+    const value = (req.body || {}).value;
+    const json = JSON.stringify(value);
+    db.query(
+        'INSERT INTO kv_site_data (`key`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = ?',
+        [req.params.key, json, json],
+        (err) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            res.json({ success: true });
+        }
+    );
+});
+app.get('/api/site-data/:key', (req, res) => {
+    db.query('SELECT value FROM kv_site_data WHERE `key` = ?', [req.params.key], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!rows || !rows.length) return res.json(null);
+        let parsed = null;
+        try { parsed = JSON.parse(rows[0].value); } catch (e) { parsed = rows[0].value; }
+        res.json({ value: parsed });
+    });
+});
+
+// Convenience direct aliases (frontend polls these paths directly)
+app.get('/api/students', (req, res) => kvGet('kv_admin_entities', 'students', res));
+app.get('/api/settings', (req, res) => kvGet('kv_blob', 'settings', res));
+
+// ══════════════════════════════════════════════════════════════════
+// 📋 ATTENDANCE — date+batch pe keyed merge (do students ek saath
+//   save karein to ek-doosre ka data overwrite na ho)
+// ══════════════════════════════════════════════════════════════════
+app.post('/api/attendance', (req, res) => {
+    const { date, batch, records, selfies, markedBy, savedAt } = req.body || {};
+    if (!date || !batch) return res.status(400).json({ error: 'date aur batch zaroori hain.' });
+    db.query('SELECT records, selfies FROM attendance_records WHERE date=? AND batch=?', [date, batch], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        let mergedRecords = records || {};
+        let mergedSelfies = selfies || {};
+        if (rows && rows.length) {
+            try { mergedRecords = Object.assign(JSON.parse(rows[0].records || '{}'), records || {}); } catch (e) {}
+            try { mergedSelfies = Object.assign(JSON.parse(rows[0].selfies || '{}'), selfies || {}); } catch (e) {}
+        }
+        db.query(
+            `INSERT INTO attendance_records (date, batch, records, selfies, markedBy, savedAt)
+             VALUES (?,?,?,?,?,?)
+             ON DUPLICATE KEY UPDATE records=VALUES(records), selfies=VALUES(selfies), markedBy=VALUES(markedBy), savedAt=VALUES(savedAt)`,
+            [date, batch, JSON.stringify(mergedRecords), JSON.stringify(mergedSelfies), markedBy || '', savedAt || new Date().toISOString()],
+            (insErr) => {
+                if (insErr) return res.status(500).json({ error: 'DB error: ' + insErr.message });
+                res.json({ success: true });
+            }
+        );
+    });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 💳 PAYMENTS — student fee, Razorpay, agent-collect transactions
+// ══════════════════════════════════════════════════════════════════
+app.post('/api/payments/fee', (req, res) => {
+    const { studentId, amount, mode, note, status } = req.body || {};
+    if (!studentId || !(amount > 0)) return res.status(400).json({ error: 'studentId aur amount zaroori hain.' });
+    db.query(
+        'INSERT INTO fee_payments (studentId, amount, mode, note, status) VALUES (?,?,?,?,?)',
+        [studentId, amount, mode || 'cash', note || '', status || 'paid'],
+        (err, result) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            res.status(201).json({ id: result.insertId });
+        }
+    );
+});
+app.get('/api/payments/fee', (req, res) => {
+    const studentId = req.query.studentId;
+    const sql = studentId ? 'SELECT * FROM fee_payments WHERE studentId=? ORDER BY created_at DESC' : 'SELECT * FROM fee_payments ORDER BY created_at DESC';
+    db.query(sql, studentId ? [studentId] : [], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json(rows || []);
+    });
+});
+
+// Razorpay order/verify — NOTE: yeh basic scaffold hai. Asli payment lene ke
+// liye Render ke Environment mein RAZORPAY_KEY_ID aur RAZORPAY_KEY_SECRET
+// add karein aur npm install razorpay karke uske SDK se order banayein.
+// Abhi yeh sirf ek mock order-id deta hai taaki UI 404 pe na atke.
+app.post('/api/payments/razorpay/order', (req, res) => {
+    if (!process.env.RAZORPAY_KEY_ID) {
+        return res.status(501).json({ error: 'Razorpay keys Render Environment mein set nahi hain (RAZORPAY_KEY_ID/SECRET).' });
+    }
+    // Yahan asli Razorpay SDK se order banega (Razorpay instance + orders.create)
+    res.status(501).json({ error: 'Razorpay integration abhi complete nahi hai — SDK setup baaki hai.' });
+});
+app.post('/api/payments/razorpay/verify', (req, res) => {
+    res.status(501).json({ error: 'Razorpay integration abhi complete nahi hai — SDK setup baaki hai.' });
+});
+
+// Agent student-collect transaction (create → pending; HRMS verify/reject)
+app.post('/api/payments/student-transaction', (req, res) => {
+    const { agentId, amount } = req.body || {};
+    if (!agentId || !(amount > 0)) return res.status(400).json({ error: 'agentId and a positive amount are required' });
+    const txnId = 'TXN' + Date.now();
+    db.query(
+        'INSERT INTO transactions (id, agentId, studentId, amount, status, data) VALUES (?,?,?,?,?,?)',
+        [txnId, agentId, req.body.studentId || null, amount, 'pending', JSON.stringify(req.body)],
+        (err) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            res.status(201).json({ txnId });
+        }
+    );
+});
+app.post('/api/payments/transactions/:id/verify', (req, res) => {
+    const id = req.params.id;
+    db.query("SELECT * FROM transactions WHERE id=? AND status='pending'", [id], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!rows || !rows.length) return res.status(404).json({ error: 'Transaction pending nahi mila.' });
+        const t = rows[0];
+        db.query("UPDATE transactions SET status='verified' WHERE id=?", [id], () => {
+            db.query(
+                `INSERT INTO agent_wallets (agentId, approved_balance, total_earned) VALUES (?,?,?)
+                 ON DUPLICATE KEY UPDATE approved_balance = approved_balance + VALUES(approved_balance),
+                                          total_earned = total_earned + VALUES(total_earned)`,
+                [t.agentId, t.amount, t.amount],
+                (wErr) => {
+                    if (wErr) return res.status(500).json({ error: 'DB error: ' + wErr.message });
+                    res.json({ success: true, txnId: id });
+                }
+            );
+        });
+    });
+});
+app.post('/api/payments/transactions/:id/reject', (req, res) => {
+    db.query("UPDATE transactions SET status='rejected', reason=? WHERE id=?", [(req.body || {}).reason || '', req.params.id], (err) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json({ success: true });
+    });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 🧾 HRMS SALARY — slips (admin-generated) + claims (staff self-submit,
+//   agent/admin verify → wallet se deduct karke payslip)
+// ══════════════════════════════════════════════════════════════════
+app.get('/api/hrms-salary/slips', (req, res) => {
+    db.query('SELECT * FROM hrms_salary_slips ORDER BY created_at DESC', (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json((rows || []).map(r => { try { return Object.assign(JSON.parse(r.data), { id: r.id }); } catch (e) { return { id: r.id }; } }));
+    });
+});
+app.get('/api/hrms-salary/claims', (req, res) => {
+    db.query('SELECT * FROM hrms_salary_claims ORDER BY created_at DESC', (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json((rows || []).map(r => { try { return Object.assign(JSON.parse(r.data), { id: r.id, status: r.status }); } catch (e) { return { id: r.id, status: r.status }; } }));
+    });
+});
+app.post('/api/hrms-salary/claims', (req, res) => {
+    const claim = req.body || {};
+    const id = claim.id || ('CLM' + Date.now());
+    db.query(
+        'INSERT INTO hrms_salary_claims (id, empId, status, netAmount, data) VALUES (?,?,?,?,?)',
+        [id, claim.empId || null, 'pending', claim.net || 0, JSON.stringify(claim)],
+        (err) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            res.status(201).json({ id });
+        }
+    );
+});
+// Staff claim → Agent verifies (deduct agent wallet)
+app.post('/api/wallet/salary-claims/:id/verify', (req, res) => {
+    const auth = getAuthUser(req);
+    const agentId = auth ? auth.username : (req.body && req.body.agentId);
+    if (!agentId) return res.status(401).json({ error: 'Agent identity nahi mili — dobara login karein.' });
+    db.query("SELECT * FROM hrms_salary_claims WHERE id=? AND status='pending'", [req.params.id], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!rows || !rows.length) return res.status(404).json({ error: 'Claim pending nahi mila.' });
+        const c = rows[0];
+        db.query('SELECT approved_balance FROM agent_wallets WHERE agentId=?', [agentId], (wErr, wRows) => {
+            if (wErr) return res.status(500).json({ error: 'DB error: ' + wErr.message });
+            const balance = wRows && wRows.length ? Number(wRows[0].approved_balance) : 0;
+            if (balance < Number(c.netAmount)) return res.status(400).json({ error: 'Aapke Wallet mein paise kam hain.' });
+            const transferDueBy = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+            db.query('UPDATE agent_wallets SET approved_balance = approved_balance - ? WHERE agentId=?', [c.netAmount, agentId], () => {
+                db.query("UPDATE hrms_salary_claims SET status='pending_admin', agentId=? WHERE id=?", [agentId, c.id], (uErr) => {
+                    if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
+                    res.json({ walletDeductedAmount: c.netAmount, transferDueBy });
+                });
+            });
+        });
+    });
+});
+// Admin final approve → generates payslip
+app.post('/api/hrms-salary/claims/:id/approve', (req, res) => {
+    db.query("SELECT * FROM hrms_salary_claims WHERE id=? AND (status='pending' OR status='pending_admin')", [req.params.id], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!rows || !rows.length) return res.status(400).json({ error: 'Yeh claim pending nahi hai (already processed).' });
+        const c = rows[0];
+        db.query("UPDATE hrms_salary_claims SET status='approved' WHERE id=?", [c.id], () => {
+            const slipId = 'SLP' + Date.now();
+            db.query('INSERT INTO hrms_salary_slips (id, empId, data) VALUES (?,?,?)', [slipId, c.empId, c.data], (sErr) => {
+                if (sErr) return res.status(500).json({ error: 'DB error: ' + sErr.message });
+                res.json({ netAmount: c.netAmount, slipId });
+            });
+        });
+    });
+});
+app.post('/api/hrms-salary/claims/:id/reject', (req, res) => {
+    db.query("UPDATE hrms_salary_claims SET status='rejected' WHERE id=? AND status IN ('pending','pending_admin')", [req.params.id], (err, result) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!result.affectedRows) return res.status(400).json({ error: 'Yeh claim pending nahi hai (already processed).' });
+        res.json({ success: true });
+    });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 👛 AGENT WALLET — balance, withdrawals, direct-collect payments
+//   NOTE: identity JWT token ke 'username' se aati hai (Agent login ke
+//   /auth/login bridge se). Production mein isse asli agentId se map
+//   karna behtar hoga agar dono alag ho sakte hain.
+// ══════════════════════════════════════════════════════════════════
+function requireAgentId(req, res) {
+    const auth = getAuthUser(req);
+    const agentId = auth ? auth.username : null;
+    if (!agentId) { res.status(401).json({ error: 'Login session nahi mila — dobara login karein.' }); return null; }
+    return agentId;
+}
+
+app.get('/api/wallet/me', (req, res) => {
+    const agentId = requireAgentId(req, res); if (!agentId) return;
+    db.query('SELECT * FROM agent_wallets WHERE agentId=?', [agentId], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json(rows && rows.length ? rows[0] : { approved_balance: 0, pending_balance: 0, total_earned: 0 });
+    });
+});
+app.get('/api/wallet/my-salary-payments', (req, res) => {
+    const agentId = requireAgentId(req, res); if (!agentId) return;
+    db.query("SELECT * FROM hrms_salary_claims WHERE agentId=? AND status IN ('pending_admin','approved') ORDER BY created_at DESC", [agentId], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json((rows || []).map(r => { try { return Object.assign(JSON.parse(r.data), { amount: r.netAmount }); } catch (e) { return { amount: r.netAmount }; } }));
+    });
+});
+app.get('/api/wallet/withdrawals/mine', (req, res) => {
+    const agentId = requireAgentId(req, res); if (!agentId) return;
+    db.query('SELECT * FROM wallet_withdrawals WHERE agentId=? ORDER BY created_at DESC', [agentId], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json(rows || []);
+    });
+});
+app.get('/api/wallet/my-direct-payments', (req, res) => {
+    const agentId = requireAgentId(req, res); if (!agentId) return;
+    db.query('SELECT * FROM wallet_direct_payments WHERE agentId=? ORDER BY created_at DESC', [agentId], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json(rows || []);
+    });
+});
+app.post('/api/wallet/withdraw', (req, res) => {
+    const agentId = requireAgentId(req, res); if (!agentId) return;
+    const { amount, accName, bankName, accNo, ifsc, agentName } = req.body || {};
+    if (!(amount > 0)) return res.status(400).json({ error: 'Sahi amount daalein.' });
+    db.query('SELECT approved_balance FROM agent_wallets WHERE agentId=?', [agentId], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        const balance = rows && rows.length ? Number(rows[0].approved_balance) : 0;
+        if (balance < amount) return res.status(400).json({ error: 'Aapke Withdrawable Balance se zyada amount hai — kam amount daalein.' });
+        db.query('UPDATE agent_wallets SET approved_balance = approved_balance - ?, pending_balance = pending_balance + ? WHERE agentId=?', [amount, amount, agentId], (uErr) => {
+            if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
+            db.query(
+                'INSERT INTO wallet_withdrawals (agentId, agentName, amount, accName, bankName, accNo, ifsc, status) VALUES (?,?,?,?,?,?,?,\'pending\')',
+                [agentId, agentName || '', amount, accName, bankName, accNo, ifsc],
+                (insErr) => {
+                    if (insErr) return res.status(500).json({ error: 'DB error: ' + insErr.message });
+                    res.status(201).json({ success: true });
+                }
+            );
+        });
+    });
+});
+// Admin: list all withdrawals + approve/reject
+app.get('/api/wallet/withdrawals', (req, res) => {
+    db.query('SELECT * FROM wallet_withdrawals ORDER BY created_at DESC', (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json(rows || []);
+    });
+});
+app.post('/api/wallet/withdrawal/:id/process', (req, res) => {
+    const { action, reason } = req.body || {};
+    db.query("SELECT * FROM wallet_withdrawals WHERE id=? AND status='pending'", [req.params.id], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!rows || !rows.length) return res.status(404).json({ error: 'Withdrawal pending nahi mila.' });
+        const w = rows[0];
+        if (action === 'approve') {
+            db.query("UPDATE wallet_withdrawals SET status='paid' WHERE id=?", [w.id], () => {
+                db.query('UPDATE agent_wallets SET pending_balance = pending_balance - ? WHERE agentId=?', [w.amount, w.agentId], (uErr) => {
+                    if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
+                    res.json({ success: true });
+                });
+            });
+        } else {
+            // reject → refund back to approved_balance
+            db.query("UPDATE wallet_withdrawals SET status='rejected', reason=? WHERE id=?", [reason || '', w.id], () => {
+                db.query('UPDATE agent_wallets SET pending_balance = pending_balance - ?, approved_balance = approved_balance + ? WHERE agentId=?', [w.amount, w.amount, w.agentId], (uErr) => {
+                    if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
+                    res.json({ success: true });
+                });
+            });
+        }
+    });
+});
+// Admin: student→agent direct-collect payments summary (today/month)
+app.get('/api/wallet/agent-direct-payments', (req, res) => {
+    db.query(
+        `SELECT
+            SUM(CASE WHEN DATE(created_at)=CURDATE() THEN amount ELSE 0 END) AS today_total,
+            SUM(CASE WHEN DATE(created_at)=CURDATE() THEN 1 ELSE 0 END) AS today_count,
+            SUM(CASE WHEN YEAR(created_at)=YEAR(CURDATE()) AND MONTH(created_at)=MONTH(CURDATE()) THEN amount ELSE 0 END) AS month_total,
+            SUM(CASE WHEN YEAR(created_at)=YEAR(CURDATE()) AND MONTH(created_at)=MONTH(CURDATE()) THEN 1 ELSE 0 END) AS month_count
+         FROM wallet_direct_payments`,
+        (err, rows) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            const r = (rows && rows[0]) || {};
+            res.json({
+                today: { total: Number(r.today_total) || 0, count: Number(r.today_count) || 0 },
+                month: { total: Number(r.month_total) || 0, count: Number(r.month_count) || 0 }
+            });
+        }
+    );
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 🧾 MATERIAL BILLS/INVOICES (Anmol_material_entry_secure.html)
+// ══════════════════════════════════════════════════════════════════
+app.post('/api/material/bills', (req, res) => {
+    const body = req.body || {};
+    const ownerUserId = body.ownerUserId;
+    if (!ownerUserId) return res.status(400).json({ error: 'ownerUserId zaroori hai.' });
+    db.query('INSERT INTO material_bills (ownerUserId, data) VALUES (?,?)', [ownerUserId, JSON.stringify(body)], (err, result) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.status(201).json({ id: result.insertId });
+    });
+});
+app.get('/api/material/bills', (req, res) => {
+    const ownerUserId = req.query.ownerUserId;
+    const sql = ownerUserId ? 'SELECT * FROM material_bills WHERE ownerUserId=? ORDER BY savedAt DESC' : 'SELECT * FROM material_bills ORDER BY savedAt DESC';
+    db.query(sql, ownerUserId ? [ownerUserId] : [], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json((rows || []).map(r => { try { return Object.assign(JSON.parse(r.data), { id: r.id, savedAt: r.savedAt }); } catch (e) { return { id: r.id, savedAt: r.savedAt }; } }));
+    });
+});
+app.put('/api/material/bills/:id', (req, res) => {
+    db.query('SELECT data FROM material_bills WHERE id=?', [req.params.id], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!rows || !rows.length) return res.status(404).json({ error: 'Bill nahi mila.' });
+        let merged = {};
+        try { merged = JSON.parse(rows[0].data); } catch (e) {}
+        Object.assign(merged, req.body || {});
+        db.query('UPDATE material_bills SET data=? WHERE id=?', [JSON.stringify(merged), req.params.id], (uErr) => {
+            if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
+            res.json({ success: true });
+        });
+    });
+});
+app.delete('/api/material/bills/:id', (req, res) => {
+    db.query('DELETE FROM material_bills WHERE id=?', [req.params.id], (err) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json({ success: true });
     });
 });
 
