@@ -506,7 +506,12 @@ app.delete('/api/blob/:key', (req, res) => {
 });
 
 // site-data: POST body { value }, GET returns { value }
+// 🔒 Sirf Admin session (JWT role='Admin') hi website content badal sake —
+//   index.html ise sirf PADHTA hai (login ke bina), yeh comment mein bhi
+//   likha tha to ab isko enforce bhi kar diya.
 app.post('/api/site-data/:key', (req, res) => {
+    const auth = getAuthUser(req);
+    if (!auth || String(auth.role).toLowerCase() !== 'admin') return res.status(401).json({ error: 'Sirf Admin login se hi website content badla ja sakta hai.' });
     const value = (req.body || {}).value;
     const json = JSON.stringify(value);
     db.query(
@@ -525,6 +530,23 @@ app.get('/api/site-data/:key', (req, res) => {
         let parsed = null;
         try { parsed = JSON.parse(rows[0].value); } catch (e) { parsed = rows[0].value; }
         res.json({ value: parsed });
+    });
+});
+
+// 🆕 COMBINED site-data — index.html ka LIVE SYNC (GET /api/site-data, bina
+//   key ke) isi ek call se ticker/hero/stats/footer/nav/login/apps saara
+//   data ek saath fetch karta hai, taaki 7 alag requests na karni padein.
+//   Admin Panel jab bhi koi ek section save karta hai (POST /site-data/:key),
+//   agli baar yeh route khud-ba-khud updated value bhej dega — koi extra
+//   kaam nahi karna padta.
+app.get('/api/site-data', (req, res) => {
+    db.query('SELECT `key`, value FROM kv_site_data', (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        const out = {};
+        (rows || []).forEach(r => {
+            try { out[r.key] = JSON.parse(r.value); } catch (e) { out[r.key] = r.value; }
+        });
+        res.json(out);
     });
 });
 
