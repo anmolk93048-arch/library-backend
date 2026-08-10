@@ -74,6 +74,19 @@ app.get('/', (req, res) => {
     res.send('Library App Backend is running successfully!');
 });
 
+// 🆕 HEALTH CHECK ROUTE — frontend ka status dot (Admin/Agent/HRMS/Student
+// portal ke '☁️ Render' indicator) isi route ko har 10 second mein poll
+// karta hai (API_BASE + '/health' → '/api/health'). Pehle ye route missing
+// tha, isliye fetch 404 deta tha aur dot hamesha red rehta tha.
+app.get('/api/health', (req, res) => {
+    res.json({
+        status: 'ok',
+        running: true,
+        db: db ? 'configured' : 'not configured',
+        timestamp: new Date().toISOString()
+    });
+});
+
 // Start Server
 app.listen(PORT, () => {
     console.log(`🚀 Server chalu hua port ${PORT} par`);
