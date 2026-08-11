@@ -1,749 +1,1181 @@
-/* ============================================================
-   ANMOL PORTAL — COMPLETE BACKEND (Express + MySQL + Cloud Run)
-   ============================================================
-   Yeh file un SAARE routes ko implement karti hai jo aapki 6
-   frontend files (Admin Panel, Agent Login, HRMS, Student
-   Attendance, Material Entry, index.html) call karti hain.
-
-   ⚠️ IMPORTANT NOTE:
-   Kuch financial/wallet routes (withdraw, razorpay, salary-claims)
-   ka EXACT business-logic (jaise interest calculation, min balance
-   rules, etc.) sirf frontend code dekh kar 100% guess nahi ho
-   sakta — maine reasonable/safe defaults likhe hain jo kaam
-   karenge, lekin agar aapke paas koi purana/dusra backend hai
-   jisme yeh logic pehle se tha, use zaroor cross-check kar lein.
-   ============================================================ */
-
 const express = require('express');
-const mysql   = require('mysql2/promise');
-const cors    = require('cors');
-const jwt     = require('jsonwebtoken');
-const multer  = require('multer');
-const path    = require('path');
-const fs      = require('fs');
+const mysql = require('mysql2');
+const cors = require('cors');
+const bodyParser = require('body-parser');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const multer = require('multer'); // 🆕 file upload (Hero image/Logo/APK) ke liye
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-/* ---------------------------------------------------------
-   1) CORS — sabse pehle, saare routes se upar
-   --------------------------------------------------------- */
+// 🆕 Render ek reverse proxy ke peeche chalta hai — isके bina Express hamesha
+// req.protocol ko 'http' samajhta, jisse upload-file wala absolute URL galti se
+// 'http://...' ban jaata (jo HTTPS Netlify site par mixed-content block ho jaata).
+app.set('trust proxy', 1);
+
+// Middleware
+// 🆕 FIX: pehle origin: '*' (wildcard) tha. Yeh un requests ke liye kaam nahi
+// karta jo 'credentials: include' bhejti hain (jaise Material Portal ka login
+// form) — browser ka niyam hai ki wildcard '*' aur credentials ek saath nahi
+// chal sakte, aur puri request "blocked by CORS policy" karke reject kar deta
+// hai. Ab yahan har request ke asli origin ko hi wapas bhej diya jaata hai
+// (reflect), jo dono tarah ki requests (credentials ke saath/bina) ke saath
+// kaam karta hai — chahe request Netlify se aaye, kisi bhi custom uploaded
+// HTML page se, ya kahin se bhi.
 app.use(cors({
-  origin: '*',   // production me chahen to apni exact Netlify URL daal dein
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+    origin: function (origin, callback) { callback(null, true); },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
 app.use(express.json({ limit: '25mb' }));
+app.use(express.urlencoded({ limit: '25mb', extended: true }));
 app.use(express.static('.'));
 
-/* ---------------------------------------------------------
-   2) Database connection
-   --------------------------------------------------------- */
+// ── Auth helper: '/auth/login' se mila JWT token decode karke
+//   req.user = { role, username } set karta hai. Token na ho / invalid ho
+//   to bhi request block nahi hoti (kai routes public/self-verifying hain
+//   jaisa Student_Attendance.html ke comment mein likha hai) — bas
+//   req.user null rehta hai. Wallet jaise identity-based routes username
+//   ko hi agentId/staffId ki tarah use karte hain. ──
+function getAuthUser(req) {
+    try {
+        const h = req.headers.authorization || '';
+        const token = h.startsWith('Bearer ') ? h.slice(7) : null;
+        if (!token) return null;
+        return jwt.verify(token, JWT_SECRET);
+    } catch (e) {
+        return null;
+    }
+}
+
+/* --------------------------------------------------------------------------
+   Database Connection (Cloud SQL & MySQL 8.4 Compatible)
+-------------------------------------------------------------------------- */
 const db = mysql.createPool({
-  host: process.env.DB_HOST || '34.93.x.x',        // <-- apna Cloud SQL IP daalein
-  user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD || 'YOUR_PASSWORD',  // <-- apna password daalein
-  database: process.env.DB_NAME || 'anmol_portal_ab',
-  waitForConnections: true,
-  connectionLimit: 10
-});
-
-const JWT_SECRET = process.env.JWT_SECRET || 'change-this-secret-in-production';
-
-/* ---------------------------------------------------------
-   3) Tables (agar exist nahi karti to khud ban jaayengi)
-   --------------------------------------------------------- */
-async function initTables() {
-  const stmts = [
-    `CREATE TABLE IF NOT EXISTS users (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      role VARCHAR(30) NOT NULL,
-      username VARCHAR(120) NOT NULL,
-      password VARCHAR(255) NOT NULL,
-      name VARCHAR(150),
-      extra JSON,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uniq_role_username (role, username)
-    )`,
-    `CREATE TABLE IF NOT EXISTS entities (
-      entity_key VARCHAR(60) PRIMARY KEY,
-      data JSON,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-    )`,
-    `CREATE TABLE IF NOT EXISTS blobs (
-      blob_key VARCHAR(60) PRIMARY KEY,
-      data JSON,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-    )`,
-    `CREATE TABLE IF NOT EXISTS site_data (
-      data_key VARCHAR(80) PRIMARY KEY,
-      value JSON,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-    )`,
-    `CREATE TABLE IF NOT EXISTS material_users (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      user_id VARCHAR(40) UNIQUE,
-      name VARCHAR(150), village VARCHAR(150), address VARCHAR(255),
-      email VARCHAR(150), mobile VARCHAR(15), photo LONGTEXT,
-      password VARCHAR(100),
-      status VARCHAR(20) DEFAULT 'pending',
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`,
-    `CREATE TABLE IF NOT EXISTS material_bills (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      owner_user_id VARCHAR(40),
-      bill_no VARCHAR(60),
-      data JSON,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      UNIQUE KEY uniq_owner_bill (owner_user_id, bill_no)
-    )`,
-    `CREATE TABLE IF NOT EXISTS wallets (
-      user_id VARCHAR(80) PRIMARY KEY,
-      role VARCHAR(30),
-      name VARCHAR(150),
-      balance DECIMAL(12,2) DEFAULT 0,
-      withdraw_pending DECIMAL(12,2) DEFAULT 0,
-      total_withdrawn DECIMAL(12,2) DEFAULT 0,
-      total_earned DECIMAL(12,2) DEFAULT 0
-    )`,
-    `CREATE TABLE IF NOT EXISTS withdrawals (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      user_id VARCHAR(80), agent_name VARCHAR(150),
-      amount DECIMAL(12,2), acc_name VARCHAR(150), bank_name VARCHAR(150),
-      acc_no VARCHAR(40), ifsc VARCHAR(20),
-      status VARCHAR(20) DEFAULT 'pending', reason VARCHAR(255),
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      processed_at DATETIME NULL
-    )`,
-    `CREATE TABLE IF NOT EXISTS direct_payments (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      user_id VARCHAR(80), amount DECIMAL(12,2), purpose VARCHAR(60),
-      razorpay_order_id VARCHAR(80), razorpay_payment_id VARCHAR(80),
-      status VARCHAR(20) DEFAULT 'created',
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`,
-    `CREATE TABLE IF NOT EXISTS salary_claims (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      user_id VARCHAR(80), role VARCHAR(30), amount DECIMAL(12,2),
-      data JSON, status VARCHAR(20) DEFAULT 'pending', reason VARCHAR(255),
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`,
-    `CREATE TABLE IF NOT EXISTS hrms_slips (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      staff_id VARCHAR(80), month VARCHAR(20), data JSON,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`,
-    `CREATE TABLE IF NOT EXISTS fee_payments (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      student_id VARCHAR(80), mobile VARCHAR(15), amount DECIMAL(12,2),
-      method VARCHAR(30), note VARCHAR(255), month_key VARCHAR(20),
-      status VARCHAR(20) DEFAULT 'paid',
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`,
-    `CREATE TABLE IF NOT EXISTS student_transactions (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      student_id VARCHAR(80), data JSON,
-      status VARCHAR(20) DEFAULT 'pending', reason VARCHAR(255),
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`,
-    `CREATE TABLE IF NOT EXISTS attendance (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      student_id VARCHAR(80), att_date DATE, status VARCHAR(20),
-      data JSON,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uniq_student_date (student_id, att_date)
-    )`
-  ];
-  for (const s of stmts) await db.query(s);
-  console.log('✅ Tables ready');
-}
-
-/* ---------------------------------------------------------
-   4) Helpers
-   --------------------------------------------------------- */
-function signToken(payload) {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' });
-}
-// Lenient auth: token ho to decode karke req.user set kar dete hain,
-// lekin route ko block nahi karte agar token missing/invalid ho —
-// kyunki frontend abhi kai jagah "best-effort" bridge token bhejta hai.
-function softAuth(req, _res, next) {
-  const h = req.headers.authorization || '';
-  const token = h.startsWith('Bearer ') ? h.slice(7) : null;
-  if (token) {
-    try { req.user = jwt.verify(token, JWT_SECRET); } catch (e) { /* ignore */ }
-  }
-  next();
-}
-app.use(softAuth);
-
-function genUserId() {
-  return 'MU' + Math.floor(100000 + Math.random() * 900000);
-}
-function genPassword() {
-  return Math.random().toString(36).slice(-8);
-}
-
-const ALLOWED_BLOB_KEYS = ['settings', 'activity', 'notices', 'mem_plans', 'members',
-  'hrms_registrations', 'staff_att', 'leave_requests', 'agent_plans', 'agent_payments',
-  'razorpay_config', 'sms_api_config'];
-
-const ALLOWED_ENTITY_KEYS = ['admins', 'staff', 'agents', 'students'];
-
-/* ---------------------------------------------------------
-   5) File uploads (site-content/upload-file)
-   --------------------------------------------------------- */
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-const upload = multer({ storage: multer.diskStorage({
-  destination: function (req, file, cb) {
-    const folder = path.join(uploadDir, (req.body.folder || 'misc').replace(/[^a-zA-Z0-9_\-]/g, '_'));
-    if (!fs.existsSync(folder)) fs.mkdirSync(folder, { recursive: true });
-    cb(null, folder);
-  },
-  filename: function (req, file, cb) {
-    cb(null, Date.now() + '_' + file.originalname.replace(/[^a-zA-Z0-9_.\-]/g, '_'));
-  }
-})});
-app.use('/uploads', express.static(uploadDir));
-
-/* ============================================================
-   ROUTES
-   ============================================================ */
-
-// ── Health ──────────────────────────────────────────────────
-app.get('/api/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
-
-// ── Auth bridge (admin / staff / agent / student login) ──────
-// Frontend apna asli password-check kar chuka hota hai (Firebase/local),
-// yeh route sirf ek session token deta hai. Pehli baar aane par user
-// record khud-ba-khud MySQL me bhi bana diya jaata hai.
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { role, username, password } = req.body;
-    if (!role || !username) return res.status(400).json({ error: 'role/username required' });
-    const [rows] = await db.query('SELECT * FROM users WHERE role=? AND username=?', [role, username]);
-    if (rows.length === 0) {
-      await db.query('INSERT INTO users (role, username, password, name) VALUES (?,?,?,?)',
-        [role, username, password || '', username]);
+    host: process.env.DB_HOST,                 // Cloud SQL Public IP — Render Environment se aayega
+    user: process.env.DB_USER,                  // DB User — Render Environment se aayega
+    password: process.env.DB_PASSWORD,           // DB Password — Render Environment se aayega
+    database: process.env.DB_NAME,               // DB Name — Render Environment se aayega
+    waitForConnections: true,
+    connectionLimit: 10,
+    ssl: {
+        rejectUnauthorized: false
+    },
+    authPlugins: {
+        mysql_clear_password: () => () => Buffer.from(process.env.DB_PASSWORD || '')
     }
-    const token = signToken({ role, username });
-    res.json({ token });
-  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── Admin entities (admins / staff / agents / students) ──────
-app.get('/api/admin-entities/:key', async (req, res) => {
-  try {
-    if (!ALLOWED_ENTITY_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown key' });
-    const [rows] = await db.query('SELECT data FROM entities WHERE entity_key=?', [req.params.key]);
-    res.json(rows.length ? rows[0].data : []);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.post('/api/admin-entities/:key', async (req, res) => {
-  try {
-    if (!ALLOWED_ENTITY_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown key' });
-    await db.query(
-      'INSERT INTO entities (entity_key, data) VALUES (?, ?) ON DUPLICATE KEY UPDATE data=VALUES(data)',
-      [req.params.key, JSON.stringify(req.body)]
-    );
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-// alias: GET /api/students (Student Attendance / Admin panel dono use karte hain)
-app.get('/api/students', async (req, res) => {
-  try {
-    const [rows] = await db.query('SELECT data FROM entities WHERE entity_key=?', ['students']);
-    res.json(rows.length ? rows[0].data : []);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
+const JWT_SECRET = process.env.JWT_SECRET;
 
-// ── Generic blob store (settings, notices, mem_plans, ...) ───
-app.get('/api/blob/:key', async (req, res) => {
-  try {
-    if (!ALLOWED_BLOB_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown key' });
-    const [rows] = await db.query('SELECT data FROM blobs WHERE blob_key=?', [req.params.key]);
-    res.json(rows.length ? rows[0].data : null);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.post('/api/blob/:key', async (req, res) => {
-  try {
-    if (!ALLOWED_BLOB_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown key' });
-    await db.query(
-      'INSERT INTO blobs (blob_key, data) VALUES (?, ?) ON DUPLICATE KEY UPDATE data=VALUES(data)',
-      [req.params.key, JSON.stringify(req.body)]
-    );
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.delete('/api/blob/:key', async (req, res) => {
-  try {
-    await db.query('DELETE FROM blobs WHERE blob_key=?', [req.params.key]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-// alias: GET /api/settings -> blob 'settings'
-app.get('/api/settings', async (req, res) => {
-  try {
-    const [rows] = await db.query('SELECT data FROM blobs WHERE blob_key=?', ['settings']);
-    res.json(rows.length ? rows[0].data : {});
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// ── Site data (index.html content, nav buttons, login options) ─
-app.get('/api/site-data', async (req, res) => {
-  try {
-    const [rows] = await db.query('SELECT data_key, value FROM site_data');
-    const out = {};
-    rows.forEach(r => { out[r.data_key] = r.value; });
-    res.json(out);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.get('/api/site-data/:key', async (req, res) => {
-  try {
-    const [rows] = await db.query('SELECT value FROM site_data WHERE data_key=?', [req.params.key]);
-    res.json(rows.length ? rows[0] : null);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.post('/api/site-data/:key', async (req, res) => {
-  try {
-    await db.query(
-      'INSERT INTO site_data (data_key, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value=VALUES(value)',
-      [req.params.key, JSON.stringify(req.body.value)]
-    );
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.post('/api/site-content/upload-file', upload.single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No file' });
-  const publicUrl = '/uploads/' + path.basename(req.file.destination) + '/' + req.file.filename;
-  res.json({ url: publicUrl, path: req.file.path, name: req.file.originalname, size: req.file.size });
-});
-
-// ── Attendance ─────────────────────────────────────────────
-app.post('/api/attendance', async (req, res) => {
-  try {
-    const { studentId, date, status } = req.body;
-    const attDate = date || new Date().toISOString().slice(0, 10);
-    await db.query(
-      `INSERT INTO attendance (student_id, att_date, status, data) VALUES (?,?,?,?)
-       ON DUPLICATE KEY UPDATE status=VALUES(status), data=VALUES(data)`,
-      [studentId, attDate, status || 'present', JSON.stringify(req.body)]
-    );
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-/* ============================================================
-   MATERIAL ENTRY PORTAL
-   ============================================================ */
-app.post('/api/material/register', async (req, res) => {
-  try {
-    const { name, village, address, email, mobile, photo } = req.body;
-    if (!name || !mobile) return res.status(400).json({ error: 'name/mobile required' });
-    const [dup] = await db.query(
-      "SELECT id FROM material_users WHERE mobile=? AND status IN ('pending','active')", [mobile]);
-    if (dup.length) return res.status(409).json({ error: 'Yeh mobile number pehle se register/pending hai.' });
-
-    await db.query(
-      `INSERT INTO material_users (user_id, name, village, address, email, mobile, photo, status)
-       VALUES (NULL, ?, ?, ?, ?, ?, ?, 'pending')`,
-      [name, village, address, email, mobile, photo || '']
-    );
-    res.json({ success: true, message: 'Registration request bhej di gayi.' });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post('/api/material/login', async (req, res) => {
-  try {
-    const { userId, secondFactor } = req.body;
-    if (!userId || !secondFactor) return res.status(400).json({ error: 'userId/secondFactor required' });
-    const [rows] = await db.query('SELECT * FROM material_users WHERE user_id=?', [userId]);
-    if (!rows.length) return res.status(404).json({ error: 'Yeh User ID registered nahi hai.' });
-    const u = rows[0];
-    if (u.status === 'blocked') return res.status(403).json({ error: 'Yeh ID block hai.' });
-    if (String(u.password) !== String(secondFactor) && String(u.mobile) !== String(secondFactor)) {
-      return res.status(401).json({ error: 'Galat password/mobile.' });
-    }
-    const token = signToken({ role: 'material_user', userId: u.user_id });
-    res.json({
-      token,
-      user: { userId: u.user_id, name: u.name, village: u.village, mobile: u.mobile, status: u.status, docId: u.id }
-    });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.get('/api/material/users/:id', async (req, res) => {
-  try {
-    const [rows] = await db.query(
-      'SELECT * FROM material_users WHERE id=? OR user_id=?', [req.params.id, req.params.id]);
-    if (!rows.length) return res.status(404).json({ error: 'Not found' });
-    const u = rows[0];
-    res.json({ userId: u.user_id, name: u.name, village: u.village, mobile: u.mobile, status: u.status, photo: u.photo || '', docId: u.id });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// ── Admin: saare (pending ke alawa) material users — listing/add/edit ──
-app.get('/api/material/users', async (req, res) => {
-  try {
-    const [rows] = await db.query("SELECT * FROM material_users WHERE status != 'pending' ORDER BY id DESC");
-    res.json(rows.map(u => ({
-      _docId: String(u.id), userId: u.user_id, name: u.name, village: u.village,
-      address: u.address, email: u.email, mobile: u.mobile, photo: u.photo,
-      status: u.status, createdAtISO: u.created_at
-    })));
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.post('/api/material/users', async (req, res) => {
-  try {
-    const { name, village, mobile, photo, status } = req.body;
-    if (!name || !village || !mobile) return res.status(400).json({ error: 'name/village/mobile required' });
-    const [dup] = await db.query("SELECT id FROM material_users WHERE mobile=? AND status != 'pending'", [mobile]);
-    if (dup.length) return res.status(409).json({ error: 'Yeh mobile number pehle se registered hai.' });
-    const userId = genUserId();
-    await db.query(
-      `INSERT INTO material_users (user_id, name, village, mobile, photo, status) VALUES (?,?,?,?,?,?)`,
-      [userId, name, village, mobile, photo || '', status || 'active']
-    );
-    res.json({ success: true, userId });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.put('/api/material/users/:id', async (req, res) => {
-  try {
-    const { name, village, mobile, status, photo, blockedReason } = req.body;
-    const fields = [], vals = [];
-    if (name !== undefined) { fields.push('name=?'); vals.push(name); }
-    if (village !== undefined) { fields.push('village=?'); vals.push(village); }
-    if (mobile !== undefined) { fields.push('mobile=?'); vals.push(mobile); }
-    if (status !== undefined) { fields.push('status=?'); vals.push(status); }
-    if (photo !== undefined) { fields.push('photo=?'); vals.push(photo); }
-    if (!fields.length) return res.json({ success: true });
-    vals.push(req.params.id);
-    await db.query(`UPDATE material_users SET ${fields.join(', ')} WHERE id=?`, vals);
-    res.json({ success: true, blockedReason: blockedReason || '' });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.delete('/api/material/users/:id', async (req, res) => {
-  try {
-    await db.query('DELETE FROM material_users WHERE id=?', [req.params.id]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// (Admin panel ke liye — pending requests list + approve/reject. Yeh
-// routes abhi Admin_panel_Login.html call NAHI karti (wo Firestore
-// use karta hai), lekin future me connect karne ke liye yahan bana di
-// gayi hain.)
-app.get('/api/material/requests', async (req, res) => {
-  try {
-    const [rows] = await db.query("SELECT * FROM material_users WHERE status='pending'");
-    res.json(rows);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.post('/api/material/requests/:id/approve', async (req, res) => {
-  try {
-    const userId = genUserId(), pass = genPassword();
-    await db.query("UPDATE material_users SET status='active', user_id=?, password=? WHERE id=?",
-      [userId, pass, req.params.id]);
-    res.json({ success: true, userId, password: pass });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.post('/api/material/requests/:id/reject', async (req, res) => {
-  try {
-    await db.query("DELETE FROM material_users WHERE id=? AND status='pending'", [req.params.id]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.get('/api/material/bills', async (req, res) => {
-  try {
-    const owner = req.query.ownerUserId;
-    const [rows] = owner
-      ? await db.query('SELECT id, data FROM material_bills WHERE owner_user_id=? ORDER BY id DESC', [owner])
-      : await db.query('SELECT id, data FROM material_bills ORDER BY id DESC');
-    res.json(rows.map(r => Object.assign({ id: r.id }, r.data)));
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.post('/api/material/bills', async (req, res) => {
-  try {
-    const data = req.body;
-    await db.query(
-      `INSERT INTO material_bills (owner_user_id, bill_no, data) VALUES (?,?,?)
-       ON DUPLICATE KEY UPDATE data=VALUES(data)`,
-      [data.ownerUserId || '', data.billNo || ('NB' + Date.now()), JSON.stringify(data)]
-    );
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.delete('/api/material/bills/:id', async (req, res) => {
-  try {
-    await db.query('DELETE FROM material_bills WHERE id=?', [req.params.id]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.put('/api/material/bills/:id', async (req, res) => {
-  try {
-    const [rows] = await db.query('SELECT data FROM material_bills WHERE id=?', [req.params.id]);
-    if (!rows.length) return res.status(404).json({ error: 'Not found' });
-    const merged = Object.assign({}, rows[0].data, req.body);
-    await db.query('UPDATE material_bills SET data=? WHERE id=?', [JSON.stringify(merged), req.params.id]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-/* ============================================================
-   WALLET (Agent balance / withdrawals / direct payments)
-   ============================================================ */
-async function getOrCreateWallet(userId, name, role) {
-  const [rows] = await db.query('SELECT * FROM wallets WHERE user_id=?', [userId]);
-  if (rows.length) return rows[0];
-  await db.query('INSERT INTO wallets (user_id, role, name) VALUES (?,?,?)', [userId, role || '', name || '']);
-  return { user_id: userId, role, name, balance: 0, withdraw_pending: 0, total_withdrawn: 0, total_earned: 0 };
+// 🔒 SECURITY: pehle DB password aur JWT secret seedhe code mein likhe the
+// (agar yeh code kabhi public GitHub repo mein hota, to password sabko dikh
+// jaata). Ab sab kuch sirf Render ke Environment Variables se aata hai —
+// koi bhi secret ab is file mein kahin nahi likha. Agar zaroori variable
+// missing ho, to server turant clearly bata dega (chup-chaap galat/khaali
+// credential se connect karne ki koshish nahi karega).
+const REQUIRED_ENV = ['DB_HOST', 'DB_USER', 'DB_PASSWORD', 'DB_NAME', 'JWT_SECRET'];
+const missingEnv = REQUIRED_ENV.filter(k => !process.env[k]);
+if (missingEnv.length) {
+    console.error('❌ Yeh zaroori Environment Variables Render Dashboard mein set nahi hain: ' + missingEnv.join(', '));
+    console.error('   Render → apni service → Environment tab mein jaakar inhe add karein, warna DB/login features kaam nahi karenge.');
 }
 
-app.get('/api/wallet/me', async (req, res) => {
-  try {
-    const userId = (req.user && (req.user.username || req.user.userId)) || req.query.userId;
-    if (!userId) return res.status(400).json({ error: 'userId required' });
-    const w = await getOrCreateWallet(userId);
-    res.json(w);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-app.post('/api/wallet/withdraw', async (req, res) => {
-  const conn = await db.getConnection();
-  try {
-    const userId = (req.user && (req.user.username || req.user.userId)) || req.body.userId || 'unknown';
-    const { amount, accName, bankName, accNo, ifsc, agentName } = req.body;
-    await conn.beginTransaction();
-    const [rows] = await conn.query('SELECT * FROM wallets WHERE user_id=? FOR UPDATE', [userId]);
-    const wallet = rows[0] || { balance: 0, withdraw_pending: 0 };
-    if (!rows.length) await conn.query('INSERT INTO wallets (user_id, name) VALUES (?,?)', [userId, agentName || '']);
-    if (Number(wallet.balance) < Number(amount)) {
-      await conn.rollback();
-      return res.status(400).json({ error: 'Withdrawable balance se zyada amount.' });
-    }
-    await conn.query('UPDATE wallets SET balance = balance - ?, withdraw_pending = withdraw_pending + ? WHERE user_id=?',
-      [amount, amount, userId]);
-    await conn.query(
-      'INSERT INTO withdrawals (user_id, agent_name, amount, acc_name, bank_name, acc_no, ifsc) VALUES (?,?,?,?,?,?,?)',
-      [userId, agentName || '', amount, accName, bankName, accNo, ifsc]
-    );
-    await conn.commit();
-    res.json({ success: true });
-  } catch (err) {
-    await conn.rollback();
-    res.status(500).json({ error: err.message });
-  } finally { conn.release(); }
-});
-
-app.get('/api/wallet/withdrawals/mine', async (req, res) => {
-  try {
-    const userId = (req.user && (req.user.username || req.user.userId)) || req.query.userId;
-    const [rows] = await db.query('SELECT * FROM withdrawals WHERE user_id=? ORDER BY id DESC', [userId]);
-    res.json(rows);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.get('/api/wallet/withdrawals', async (req, res) => {
-  try {
-    const [rows] = await db.query('SELECT * FROM withdrawals ORDER BY id DESC');
-    res.json(rows);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.post('/api/wallet/withdrawal/:id/process', async (req, res) => {
-  const conn = await db.getConnection();
-  try {
-    const { action, reason } = req.body;
-    await conn.beginTransaction();
-    const [rows] = await conn.query('SELECT * FROM withdrawals WHERE id=? FOR UPDATE', [req.params.id]);
-    if (!rows.length) { await conn.rollback(); return res.status(404).json({ error: 'Not found' }); }
-    const w = rows[0];
-    if (action === 'approve') {
-      await conn.query("UPDATE withdrawals SET status='paid', processed_at=NOW() WHERE id=?", [req.params.id]);
-      await conn.query('UPDATE wallets SET withdraw_pending = withdraw_pending - ?, total_withdrawn = total_withdrawn + ? WHERE user_id=?',
-        [w.amount, w.amount, w.user_id]);
+// Test Database Connection & Tables Setup
+db.getConnection((err, connection) => {
+    if (err) {
+        console.error('❌ Table setup fail hua: ' + err.message);
     } else {
-      await conn.query("UPDATE withdrawals SET status='rejected', reason=?, processed_at=NOW() WHERE id=?", [reason || '', req.params.id]);
-      await conn.query('UPDATE wallets SET withdraw_pending = withdraw_pending - ?, balance = balance + ? WHERE user_id=?',
-        [w.amount, w.amount, w.user_id]);
+        console.log('✓ Database se successfully connection jud gaya hai!');
+        
+        // Create basic tables if not exist
+        const createUsersTable = `
+            CREATE TABLE IF NOT EXISTS users (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                password VARCHAR(255) NOT NULL,
+                role VARCHAR(50) DEFAULT 'user',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `;
+        
+        connection.query(createUsersTable, (tableErr) => {
+            if (tableErr) {
+                console.error('❌ Users table creation error:', tableErr.message);
+            } else {
+                console.log('✅ Tables ready');
+            }
+        });
+
+        // 🆕 Material user pending-registration requests (Anmol_material_entry_secure.html
+        // ke "रजिस्ट्रेशन अनुरोध भेजें" form se yahan aata hai, admin approve karta hai)
+        const createMaterialRequestsTable = `
+            CREATE TABLE IF NOT EXISTS material_user_requests (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                village VARCHAR(255),
+                address VARCHAR(500),
+                email VARCHAR(255),
+                mobile VARCHAR(20) NOT NULL,
+                photo LONGTEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `;
+        connection.query(createMaterialRequestsTable, (tableErr) => {
+            if (tableErr) console.error('❌ material_user_requests table error:', tableErr.message);
+        });
+
+        // 🆕 Approved material users / agents (jinhe userId + password mil chuka hai
+        // aur jo Anmol_material_entry_secure.html se login karke bill entry karte hain)
+        const createMaterialUsersTable = `
+            CREATE TABLE IF NOT EXISTS material_users (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                userId VARCHAR(50) UNIQUE NOT NULL,
+                name VARCHAR(255) NOT NULL,
+                village VARCHAR(255),
+                address VARCHAR(500),
+                email VARCHAR(255),
+                mobile VARCHAR(20) UNIQUE NOT NULL,
+                photo LONGTEXT,
+                password_hash VARCHAR(255),
+                status VARCHAR(20) DEFAULT 'active',
+                blockedReason VARCHAR(500),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `;
+        connection.query(createMaterialUsersTable, (tableErr) => {
+            if (tableErr) console.error('❌ material_users table error:', tableErr.message);
+        });
+
+        // 🆕 Material bills/invoices (Anmol_material_entry_secure.html)
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS material_bills (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                ownerUserId VARCHAR(50) NOT NULL,
+                data LONGTEXT,
+                savedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `, (e) => { if (e) console.error('❌ material_bills table error:', e.message); });
+
+        // 🆕 Generic key-value stores — admin-entities (admins/staff/agents/students
+        // arrays) aur blob (settings/notices/mem_plans/... — routes/blob.js jaisa)
+        // aur site-data (site content JSON). Frontend hamesha poori array/object
+        // ek saath bhejta-padta hai, isliye ek generic table kaafi hai.
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS kv_admin_entities (
+                \`key\` VARCHAR(100) PRIMARY KEY,
+                value LONGTEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            )
+        `, (e) => { if (e) console.error('❌ kv_admin_entities table error:', e.message); });
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS kv_blob (
+                \`key\` VARCHAR(100) PRIMARY KEY,
+                value LONGTEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            )
+        `, (e) => { if (e) console.error('❌ kv_blob table error:', e.message); });
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS kv_site_data (
+                \`key\` VARCHAR(100) PRIMARY KEY,
+                value LONGTEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            )
+        `, (e) => { if (e) console.error('❌ kv_site_data table error:', e.message); });
+
+        // 🆕 Attendance (date+batch pe keyed merge — Student_Attendance.html)
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS attendance_records (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                date VARCHAR(20) NOT NULL,
+                batch VARCHAR(20) NOT NULL,
+                records LONGTEXT,
+                selfies LONGTEXT,
+                markedBy VARCHAR(255),
+                savedAt VARCHAR(50),
+                UNIQUE KEY date_batch (date, batch)
+            )
+        `, (e) => { if (e) console.error('❌ attendance_records table error:', e.message); });
+
+        // 🆕 Student fee payments
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS fee_payments (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                studentId VARCHAR(100) NOT NULL,
+                amount DECIMAL(10,2) NOT NULL,
+                mode VARCHAR(50),
+                note VARCHAR(500),
+                status VARCHAR(20) DEFAULT 'paid',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `, (e) => { if (e) console.error('❌ fee_payments table error:', e.message); });
+
+        // 🆕 Student → Agent direct-collect transactions (HRMS verify/reject flow)
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS transactions (
+                id VARCHAR(50) PRIMARY KEY,
+                agentId VARCHAR(100),
+                studentId VARCHAR(100),
+                amount DECIMAL(10,2) NOT NULL,
+                status VARCHAR(20) DEFAULT 'pending',
+                reason VARCHAR(500),
+                data LONGTEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `, (e) => { if (e) console.error('❌ transactions table error:', e.message); });
+
+        // 🆕 HRMS salary slips (admin-generated) + claims (staff self-submitted)
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS hrms_salary_slips (
+                id VARCHAR(50) PRIMARY KEY,
+                empId VARCHAR(100),
+                data LONGTEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `, (e) => { if (e) console.error('❌ hrms_salary_slips table error:', e.message); });
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS hrms_salary_claims (
+                id VARCHAR(50) PRIMARY KEY,
+                empId VARCHAR(100),
+                status VARCHAR(30) DEFAULT 'pending',
+                agentId VARCHAR(100),
+                netAmount DECIMAL(10,2),
+                data LONGTEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `, (e) => { if (e) console.error('❌ hrms_salary_claims table error:', e.message); });
+
+        // 🆕 Agent wallets + withdrawals + direct payments
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS agent_wallets (
+                agentId VARCHAR(100) PRIMARY KEY,
+                approved_balance DECIMAL(12,2) DEFAULT 0,
+                pending_balance DECIMAL(12,2) DEFAULT 0,
+                total_earned DECIMAL(12,2) DEFAULT 0
+            )
+        `, (e) => { if (e) console.error('❌ agent_wallets table error:', e.message); });
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS wallet_withdrawals (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                agentId VARCHAR(100) NOT NULL,
+                agentName VARCHAR(255),
+                amount DECIMAL(10,2) NOT NULL,
+                accName VARCHAR(255), bankName VARCHAR(255), accNo VARCHAR(50), ifsc VARCHAR(20),
+                status VARCHAR(20) DEFAULT 'pending',
+                reason VARCHAR(500),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `, (e) => { if (e) console.error('❌ wallet_withdrawals table error:', e.message); });
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS wallet_direct_payments (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                agentId VARCHAR(100) NOT NULL,
+                amount DECIMAL(10,2) NOT NULL,
+                note VARCHAR(500),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `, (e) => { if (e) console.error('❌ wallet_direct_payments table error:', e.message); });
+
+        // 🆕 Uploaded files (Hero image / Logo / APK / login-page HTML) — DB mein
+        // hi blob ki tarah store hote hain, kyunki Render ka disk restart/redeploy
+        // pe reset ho jaata hai (isliye seedhe filesystem pe save karna safe nahi).
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS site_files (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                folder VARCHAR(100),
+                name VARCHAR(255),
+                mime VARCHAR(150),
+                size INT,
+                data LONGBLOB,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `, (e) => {
+            if (e) console.error('❌ site_files table error:', e.message);
+            connection.release();
+            console.log('✅ Saari tables ready — koi bhi feature ab 404 nahi dega.');
+        });
     }
-    await conn.commit();
-    res.json({ success: true });
-  } catch (err) {
-    await conn.rollback();
-    res.status(500).json({ error: err.message });
-  } finally { conn.release(); }
 });
 
-app.get('/api/wallet/my-direct-payments', async (req, res) => {
-  try {
-    const userId = (req.user && (req.user.username || req.user.userId)) || req.query.userId;
-    const [rows] = await db.query('SELECT * FROM direct_payments WHERE user_id=? ORDER BY id DESC', [userId]);
-    res.json(rows);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.get('/api/wallet/agent-direct-payments', async (req, res) => {
-  try {
-    const [rows] = await db.query('SELECT * FROM direct_payments ORDER BY id DESC');
-    res.json(rows);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
+// ── Helpers: MU0001-style userId aur ek random 6-char password ──
+function genMaterialUserId(cb) {
+    db.query("SELECT userId FROM material_users WHERE userId LIKE 'MU%'", (err, rows) => {
+        if (err) return cb(err);
+        let max = 0;
+        (rows || []).forEach(r => {
+            const num = parseInt(String(r.userId).replace('MU', ''), 10) || 0;
+            if (num > max) max = num;
+        });
+        cb(null, 'MU' + String(max + 1).padStart(3, '0'));
+    });
+}
+function genMuPassword() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let pwd = '';
+    for (let i = 0; i < 6; i++) pwd += chars.charAt(Math.floor(Math.random() * chars.length));
+    return pwd;
+}
 
-app.get('/api/wallet/my-salary-payments', async (req, res) => {
-  try {
-    const userId = (req.user && (req.user.username || req.user.userId)) || req.query.userId;
-    const [rows] = await db.query("SELECT * FROM salary_claims WHERE user_id=? AND status='paid' ORDER BY id DESC", [userId]);
-    res.json(rows);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.post('/api/wallet/salary-claims/:id/verify', async (req, res) => {
-  try {
-    await db.query("UPDATE salary_claims SET status='paid' WHERE id=?", [req.params.id]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
+// ══════════════════════════════════════════════════════════════════
+// 🆕 MATERIAL USER / AGENT REGISTRATION & LOGIN ROUTES
+//   (Anmol_material_entry_secure.html + Admin_panel_Login.html isi
+//   se judte hain — pehle ye routes missing the, isliye 404 aata tha)
+// ══════════════════════════════════════════════════════════════════
 
-/* ============================================================
-   PAYMENTS (Razorpay / Student fee / transactions)
-   ============================================================ */
-app.post('/api/payments/razorpay/order', async (req, res) => {
-  try {
-    // NOTE: Yahan real Razorpay SDK call honi chahiye (razorpay npm
-    // package + key_id/key_secret). Abhi ek mock order id de rahe
-    // hain taaki flow test ho sake — production me isse Razorpay ke
-    // asli orders.create() se replace karein.
-    const { amount, purpose } = req.body;
-    const [result] = await db.query(
-      'INSERT INTO direct_payments (user_id, amount, purpose, razorpay_order_id, status) VALUES (?,?,?,?,?)',
-      [(req.user && req.user.username) || 'unknown', amount, purpose || '', 'order_' + Date.now(), 'created']
-    );
-    res.json({ id: 'order_' + Date.now(), amount, currency: 'INR', paymentRowId: result.insertId });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.post('/api/payments/razorpay/verify', async (req, res) => {
-  try {
-    const { paymentRowId, razorpay_payment_id } = req.body;
-    if (paymentRowId) {
-      await db.query("UPDATE direct_payments SET status='paid', razorpay_payment_id=? WHERE id=?",
-        [razorpay_payment_id || '', paymentRowId]);
-      await db.query('UPDATE wallets SET balance = balance + (SELECT amount FROM direct_payments WHERE id=?) WHERE user_id=(SELECT user_id FROM direct_payments WHERE id=?)',
-        [paymentRowId, paymentRowId]);
+// 1) Public self-registration request (material_entry portal ka form)
+app.post('/api/material/register', (req, res) => {
+    const { name, village, address, email, mobile, photo } = req.body || {};
+    if (!name || !village || !address || !email || !mobile) {
+        return res.status(400).json({ error: 'Saari zaroori fields bharein.' });
     }
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const dupSql = `SELECT id FROM material_users WHERE mobile = ?
+                     UNION SELECT id FROM material_user_requests WHERE mobile = ?`;
+    db.query(dupSql, [mobile, mobile], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (rows && rows.length) {
+            return res.status(409).json({ error: 'Yeh mobile number pehle se registered ya pending mein hai.' });
+        }
+        db.query(
+            'INSERT INTO material_user_requests (name, village, address, email, mobile, photo) VALUES (?,?,?,?,?,?)',
+            [name, village, address, email, mobile, photo || null],
+            (insErr) => {
+                if (insErr) return res.status(500).json({ error: 'DB error: ' + insErr.message });
+                res.status(201).json({ success: true });
+            }
+        );
+    });
 });
 
-app.post('/api/payments/fee', async (req, res) => {
-  try {
-    const { studentId, mobile, amount, method, note, monthKey } = req.body;
-    const [result] = await db.query(
-      'INSERT INTO fee_payments (student_id, mobile, amount, method, note, month_key) VALUES (?,?,?,?,?,?)',
-      [studentId, mobile, amount, method, note, monthKey]
-    );
-    res.json({ success: true, payment: { id: result.insertId, studentId, amount, method, note, monthKey, status: 'paid' } });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+// 2) Admin: pending requests list
+app.get('/api/material/requests', (req, res) => {
+    db.query('SELECT * FROM material_user_requests ORDER BY created_at DESC', (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json(rows || []);
+    });
 });
-app.get('/api/payments/fee', async (req, res) => {
-  try {
+
+// 3) Admin: approve a request → generates userId + password, moves it into material_users
+app.post('/api/material/requests/:id/approve', (req, res) => {
+    const reqId = req.params.id;
+    db.query('SELECT * FROM material_user_requests WHERE id = ?', [reqId], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!rows || !rows.length) return res.status(404).json({ error: 'Request nahi mili.' });
+        const r = rows[0];
+        genMaterialUserId((idErr, userId) => {
+            if (idErr) return res.status(500).json({ error: 'DB error: ' + idErr.message });
+            const plainPassword = genMuPassword();
+            const passwordHash = bcrypt.hashSync(plainPassword, 10);
+            db.query(
+                `INSERT INTO material_users (userId, name, village, address, email, mobile, photo, password_hash, status)
+                 VALUES (?,?,?,?,?,?,?,?, 'active')`,
+                [userId, r.name, r.village, r.address, r.email, r.mobile, r.photo, passwordHash],
+                (insErr) => {
+                    if (insErr) return res.status(500).json({ error: 'DB error: ' + insErr.message });
+                    db.query('DELETE FROM material_user_requests WHERE id = ?', [reqId], () => {
+                        res.json({ userId, password: plainPassword });
+                    });
+                }
+            );
+        });
+    });
+});
+
+// 4) Admin: reject/delete a pending request
+app.post('/api/material/requests/:id/reject', (req, res) => {
+    db.query('DELETE FROM material_user_requests WHERE id = ?', [req.params.id], (err) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json({ success: true });
+    });
+});
+
+// 5) Admin: list all material users (Admin Panel table)
+app.get('/api/material/users', (req, res) => {
+    db.query('SELECT id, userId, name, village, address, email, mobile, photo, status, blockedReason, created_at FROM material_users ORDER BY created_at DESC', (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        const mapped = (rows || []).map(u => Object.assign({ _docId: String(u.id) }, u));
+        res.json(mapped);
+    });
+});
+
+// 6) Admin: directly create a material user (bina request ke, "New Material User Register" form)
+app.post('/api/material/users', (req, res) => {
+    const { name, village, mobile, photo, status } = req.body || {};
+    if (!name || !village || !mobile) {
+        return res.status(400).json({ error: 'Naam, Village aur Mobile zaroori hai!' });
+    }
+    db.query('SELECT id FROM material_users WHERE mobile = ?', [mobile], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (rows && rows.length) return res.status(409).json({ error: 'Yeh mobile number pehle se registered hai!' });
+        genMaterialUserId((idErr, userId) => {
+            if (idErr) return res.status(500).json({ error: 'DB error: ' + idErr.message });
+            const passwordHash = bcrypt.hashSync(genMuPassword(), 10);
+            db.query(
+                `INSERT INTO material_users (userId, name, village, mobile, photo, password_hash, status)
+                 VALUES (?,?,?,?,?,?,?)`,
+                [userId, name, village, mobile, photo || null, passwordHash, status || 'active'],
+                (insErr) => {
+                    if (insErr) return res.status(500).json({ error: 'DB error: ' + insErr.message });
+                    res.status(201).json({ userId });
+                }
+            );
+        });
+    });
+});
+
+// 7) Admin: edit / block / unblock a material user
+app.put('/api/material/users/:id', (req, res) => {
+    const fields = req.body || {};
+    const allowed = ['name', 'village', 'address', 'email', 'mobile', 'photo', 'status', 'blockedReason'];
+    const sets = [];
+    const values = [];
+    allowed.forEach(f => {
+        if (Object.prototype.hasOwnProperty.call(fields, f)) {
+            sets.push(f + ' = ?');
+            values.push(fields[f]);
+        }
+    });
+    if (!sets.length) return res.status(400).json({ error: 'Update karne ke liye kuch bhi nahi bheja gaya.' });
+    values.push(req.params.id);
+    db.query(`UPDATE material_users SET ${sets.join(', ')} WHERE id = ?`, values, (err) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json({ success: true });
+    });
+});
+
+// 7b) Admin/Live-sync: single material user ki details (photo field ke saath —
+//     Anmol_material_entry_secure.html ka live-profile-sync isi route ko har
+//     12 second mein poll karta hai taaki photo/status turant update ho jaaye)
+app.get('/api/material/users/:id', (req, res) => {
+    db.query(
+        'SELECT id, userId, name, village, address, email, mobile, photo, status, blockedReason, created_at FROM material_users WHERE id = ?',
+        [req.params.id],
+        (err, rows) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            if (!rows || !rows.length) return res.status(404).json({ error: 'Yeh material user nahi mila.' });
+            res.json(Object.assign({ _docId: String(rows[0].id) }, rows[0]));
+        }
+    );
+});
+
+// 7c) Admin: material user ko permanently delete karna (Admin Panel "Delete User" feature)
+app.delete('/api/material/users/:id', (req, res) => {
+    db.query('DELETE FROM material_users WHERE id = ?', [req.params.id], (err, result) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!result || !result.affectedRows) return res.status(404).json({ error: 'Yeh material user nahi mila.' });
+        res.json({ success: true });
+    });
+});
+
+// 8) Material user login (userId + mobile-number-or-admin-issued-password)
+app.post('/api/material/login', (req, res) => {
+    try {
+        const userId = req.body && req.body.userId;
+        // 🆕 FIX: 'secondFactor' hamesha String() mein convert kiya jaata hai —
+        // agar frontend isse number ki tarah bhejta (jaise sirf mobile digits),
+        // to bcrypt.compareSync() ek TypeError throw karta tha jo kahin bhi
+        // catch nahi hota tha — poora Node.js process crash ho jaata tha!
+        // Isi wajah se browser mein "Failed to fetch" (blank status) aata tha
+        // — request backend tak pahunchi, par server hi crash ho gaya.
+        const secondFactor = req.body && req.body.secondFactor != null ? String(req.body.secondFactor) : '';
+        if (!userId || !secondFactor) return res.status(400).json({ error: 'User ID aur Mobile/Password dono zaroori hain.' });
+        db.query('SELECT * FROM material_users WHERE userId = ?', [String(userId)], (err, rows) => {
+            try {
+                if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+                if (!rows || !rows.length) return res.status(404).json({ error: 'Yeh User ID registered nahi hai.' });
+                const u = rows[0];
+                if (u.status === 'blocked') {
+                    return res.status(403).json({ error: 'Yeh ID admin dwara block kar di gayi hai.' });
+                }
+                const mobileMatches = String(u.mobile || '').replace(/\D/g, '').slice(-10) === secondFactor.replace(/\D/g, '').slice(-10);
+                const passwordMatches = (u.password_hash && typeof u.password_hash === 'string')
+                    ? bcrypt.compareSync(secondFactor, u.password_hash)
+                    : false;
+                if (!mobileMatches && !passwordMatches) {
+                    return res.status(401).json({ error: 'Galat Mobile Number ya Password.' });
+                }
+                const token = jwt.sign({ userId: u.userId, role: 'material_user' }, JWT_SECRET, { expiresIn: '7d' });
+                const { password_hash, ...userSafe } = u;
+                userSafe._docId = String(u.id);
+                res.json({ user: userSafe, token });
+            } catch (innerErr) {
+                console.error('❌ /material/login inner error:', innerErr.message);
+                res.status(500).json({ error: 'Login process karte waqt error aaya: ' + innerErr.message });
+            }
+        });
+    } catch (outerErr) {
+        console.error('❌ /material/login outer error:', outerErr.message);
+        res.status(500).json({ error: 'Login request mein error aaya: ' + outerErr.message });
+    }
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 🔐 AUTH BRIDGE — Admin/Agent/Student login khud client-side (Firebase
+//   data ke against) hota hai; yeh route sirf ek session token deta hai
+//   taaki wallet/salary jaisi identity-based routes kaam kar sakein.
+// ══════════════════════════════════════════════════════════════════
+app.post('/api/auth/login', (req, res) => {
+    const { role, username } = req.body || {};
+    if (!role || !username) return res.status(400).json({ error: 'role aur username zaroori hain.' });
+    const token = jwt.sign({ role, username }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 🗄️ GENERIC KEY-VALUE STORES — admin-entities / blob / site-data
+//   (Admin Panel ke FBSync.pull/push isi se judte hain)
+// ══════════════════════════════════════════════════════════════════
+const ENTITY_KEYS = ['admins', 'staff', 'agents', 'students'];
+const BLOB_KEYS = ['settings', 'activity', 'notices', 'mem_plans', 'members',
+    'hrms_registrations', 'staff_att', 'leave_requests', 'agent_plans', 'agent_payments',
+    'razorpay_config', 'sms_api_config'];
+
+function kvGet(table, key, res, wrapValue) {
+    db.query(`SELECT value FROM ${table} WHERE \`key\` = ?`, [key], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!rows || !rows.length) return res.json(wrapValue ? null : null);
+        let parsed = null;
+        try { parsed = JSON.parse(rows[0].value); } catch (e) { parsed = rows[0].value; }
+        res.json(parsed);
+    });
+}
+function kvSet(table, key, value, res) {
+    const json = JSON.stringify(value);
+    db.query(
+        `INSERT INTO ${table} (\`key\`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = ?`,
+        [key, json, json],
+        (err) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            res.json({ success: true });
+        }
+    );
+}
+
+app.get('/api/admin-entities/:key', (req, res) => {
+    if (!ENTITY_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown entity key' });
+    kvGet('kv_admin_entities', req.params.key, res);
+});
+app.post('/api/admin-entities/:key', (req, res) => {
+    if (!ENTITY_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown entity key' });
+    kvSet('kv_admin_entities', req.params.key, req.body, res);
+});
+
+app.get('/api/blob/:key', (req, res) => {
+    if (!BLOB_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown blob key' });
+    kvGet('kv_blob', req.params.key, res);
+});
+app.post('/api/blob/:key', (req, res) => {
+    if (!BLOB_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown blob key' });
+    kvSet('kv_blob', req.params.key, req.body, res);
+});
+app.delete('/api/blob/:key', (req, res) => {
+    db.query('DELETE FROM kv_blob WHERE `key` = ?', [req.params.key], (err) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json({ success: true });
+    });
+});
+
+// site-data: POST body { value }, GET returns { value }
+// 🔒 Sirf Admin session (JWT role='Admin') hi website content badal sake —
+//   index.html ise sirf PADHTA hai (login ke bina), yeh comment mein bhi
+//   likha tha to ab isko enforce bhi kar diya.
+app.post('/api/site-data/:key', (req, res) => {
+    const auth = getAuthUser(req);
+    if (!auth || String(auth.role).toLowerCase() !== 'admin') return res.status(401).json({ error: 'Sirf Admin login se hi website content badla ja sakta hai.' });
+    const value = (req.body || {}).value;
+    const json = JSON.stringify(value);
+    db.query(
+        'INSERT INTO kv_site_data (`key`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = ?',
+        [req.params.key, json, json],
+        (err) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            res.json({ success: true });
+        }
+    );
+});
+app.get('/api/site-data/:key', (req, res) => {
+    db.query('SELECT value FROM kv_site_data WHERE `key` = ?', [req.params.key], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!rows || !rows.length) return res.json(null);
+        let parsed = null;
+        try { parsed = JSON.parse(rows[0].value); } catch (e) { parsed = rows[0].value; }
+        res.json({ value: parsed });
+    });
+});
+
+// 🆕 COMBINED site-data — index.html ka LIVE SYNC (GET /api/site-data, bina
+//   key ke) isi ek call se ticker/hero/stats/footer/nav/login/apps saara
+//   data ek saath fetch karta hai, taaki 7 alag requests na karni padein.
+//   Admin Panel jab bhi koi ek section save karta hai (POST /site-data/:key),
+//   agli baar yeh route khud-ba-khud updated value bhej dega — koi extra
+//   kaam nahi karna padta.
+app.get('/api/site-data', (req, res) => {
+    db.query('SELECT `key`, value FROM kv_site_data', (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        const out = {};
+        (rows || []).forEach(r => {
+            try { out[r.key] = JSON.parse(r.value); } catch (e) { out[r.key] = r.value; }
+        });
+        res.json(out);
+    });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 📤 FILE UPLOAD — Hero image / Logo / Login-page HTML / APK
+//   (Admin_panel_Login.html ka gcsUploadFile() isi route ko call karta
+//   hai; pehle yeh route missing tha isliye Express ka default 404 HTML
+//   aata tha aur frontend "Unexpected token '<'..." error deta tha.)
+//   Memory mein hi rakha jaata hai (Multer memoryStorage) aur seedhe MySQL
+//   mein blob ki tarah save hota hai — Render ke ephemeral disk pe nahi,
+//   isliye redeploy/restart hone par bhi file gayab nahi hoti.
+// ══════════════════════════════════════════════════════════════════
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB max
+
+app.post('/api/site-content/upload-file', upload.single('file'), (req, res) => {
+    const auth = getAuthUser(req);
+    if (!auth || String(auth.role).toLowerCase() !== 'admin') return res.status(401).json({ error: 'Sirf Admin login se hi file upload ho sakti hai.' });
+    if (!req.file) return res.status(400).json({ error: 'Koi file mili nahi (form field ka naam "file" hona chahiye).' });
+    const folder = req.body.folder || 'misc';
+    db.query(
+        'INSERT INTO site_files (folder, name, mime, size, data) VALUES (?,?,?,?,?)',
+        [folder, req.file.originalname, req.file.mimetype, req.file.size, req.file.buffer],
+        (err, result) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            const id = result.insertId;
+            // 🆕 FIX: pehle sirf relative path ('/api/site-content/file/123') bheja
+            // jaata tha. Netlify (index.html) par jab is link par click hota tha,
+            // to browser use apne HI domain (netlify.app) se jodta tha — Render se
+            // nahi — isliye "Page not found" aata tha. Ab poora ABSOLUTE URL
+            // (asli Render domain ke saath) bheja jaata hai, taaki link kahin se
+            // bhi click karo, hamesha sahi jagah (Render backend) khule.
+            const path = '/api/site-content/file/' + id;
+            const absoluteUrl = req.protocol + '://' + req.get('host') + path;
+            res.status(201).json({ url: absoluteUrl, path: absoluteUrl, name: req.file.originalname, size: req.file.size });
+        }
+    );
+});
+
+// File serve — jo bhi upload-file se URL mila tha, wahi yahan se file waapas deta hai
+app.get('/api/site-content/file/:id', (req, res) => {
+    db.query('SELECT name, mime, data FROM site_files WHERE id=?', [req.params.id], (err, rows) => {
+        if (err) return res.status(500).send('DB error');
+        if (!rows || !rows.length) return res.status(404).send('File not found');
+        const f = rows[0];
+        res.set('Content-Type', f.mime || 'application/octet-stream');
+        res.set('Content-Disposition', 'inline; filename="' + f.name + '"');
+        res.send(f.data);
+    });
+});
+
+// Convenience direct aliases (frontend polls these paths directly)
+app.get('/api/students', (req, res) => kvGet('kv_admin_entities', 'students', res));
+app.get('/api/settings', (req, res) => kvGet('kv_blob', 'settings', res));
+
+// ══════════════════════════════════════════════════════════════════
+// 📋 ATTENDANCE — date+batch pe keyed merge (do students ek saath
+//   save karein to ek-doosre ka data overwrite na ho)
+// ══════════════════════════════════════════════════════════════════
+app.post('/api/attendance', (req, res) => {
+    const { date, batch, records, selfies, markedBy, savedAt } = req.body || {};
+    if (!date || !batch) return res.status(400).json({ error: 'date aur batch zaroori hain.' });
+    db.query('SELECT records, selfies FROM attendance_records WHERE date=? AND batch=?', [date, batch], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        let mergedRecords = records || {};
+        let mergedSelfies = selfies || {};
+        if (rows && rows.length) {
+            try { mergedRecords = Object.assign(JSON.parse(rows[0].records || '{}'), records || {}); } catch (e) {}
+            try { mergedSelfies = Object.assign(JSON.parse(rows[0].selfies || '{}'), selfies || {}); } catch (e) {}
+        }
+        db.query(
+            `INSERT INTO attendance_records (date, batch, records, selfies, markedBy, savedAt)
+             VALUES (?,?,?,?,?,?)
+             ON DUPLICATE KEY UPDATE records=VALUES(records), selfies=VALUES(selfies), markedBy=VALUES(markedBy), savedAt=VALUES(savedAt)`,
+            [date, batch, JSON.stringify(mergedRecords), JSON.stringify(mergedSelfies), markedBy || '', savedAt || new Date().toISOString()],
+            (insErr) => {
+                if (insErr) return res.status(500).json({ error: 'DB error: ' + insErr.message });
+                res.json({ success: true });
+            }
+        );
+    });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 💳 PAYMENTS — student fee, Razorpay, agent-collect transactions
+// ══════════════════════════════════════════════════════════════════
+app.post('/api/payments/fee', (req, res) => {
+    const { studentId, amount, mode, note, status } = req.body || {};
+    if (!studentId || !(amount > 0)) return res.status(400).json({ error: 'studentId aur amount zaroori hain.' });
+    db.query(
+        'INSERT INTO fee_payments (studentId, amount, mode, note, status) VALUES (?,?,?,?,?)',
+        [studentId, amount, mode || 'cash', note || '', status || 'paid'],
+        (err, result) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            res.status(201).json({ id: result.insertId });
+        }
+    );
+});
+app.get('/api/payments/fee', (req, res) => {
     const studentId = req.query.studentId;
-    const [rows] = await db.query('SELECT * FROM fee_payments WHERE student_id=? ORDER BY id DESC', [studentId]);
-    res.json(rows);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const sql = studentId ? 'SELECT * FROM fee_payments WHERE studentId=? ORDER BY created_at DESC' : 'SELECT * FROM fee_payments ORDER BY created_at DESC';
+    db.query(sql, studentId ? [studentId] : [], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json(rows || []);
+    });
 });
 
-app.post('/api/payments/student-transaction', async (req, res) => {
-  try {
-    const { studentId } = req.body;
-    const [result] = await db.query('INSERT INTO student_transactions (student_id, data) VALUES (?,?)',
-      [studentId, JSON.stringify(req.body)]);
-    res.json({ success: true, id: result.insertId });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.post('/api/payments/transactions/:id/verify', async (req, res) => {
-  try {
-    await db.query("UPDATE student_transactions SET status='verified' WHERE id=?", [req.params.id]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.post('/api/payments/transactions/:id/reject', async (req, res) => {
-  try {
-    await db.query("UPDATE student_transactions SET status='rejected', reason=? WHERE id=?",
-      [req.body.reason || '', req.params.id]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+// ══════════════════════════════════════════════════════════════════
+// 💳 RAZORPAY — order create + payment verify
+//   Keys kabhi bhi code mein nahi likhi jaatin — dono Render Dashboard ke
+//   Environment Variables se aati hain:
+//     PAYMENT_API_KEY    → Razorpay "Key ID"
+//     PAYMENT_API_SECRET → Razorpay "Key Secret"
+//   (Node ke built-in 'https'/'crypto' se hi kaam chal jaata hai, isliye
+//   koi naya npm package install karne ki zaroorat nahi.)
+// ══════════════════════════════════════════════════════════════════
+const https = require('https');
+const crypto = require('crypto');
+
+function razorpayRequest(path, body) {
+    return new Promise((resolve, reject) => {
+        const key = process.env.PAYMENT_API_KEY;
+        const secret = process.env.PAYMENT_API_SECRET;
+        if (!key || !secret) return reject(new Error('PAYMENT_API_KEY / PAYMENT_API_SECRET Render Environment mein set nahi hain.'));
+        const payload = JSON.stringify(body);
+        const options = {
+            hostname: 'api.razorpay.com',
+            path,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(payload),
+                'Authorization': 'Basic ' + Buffer.from(key + ':' + secret).toString('base64')
+            }
+        };
+        const reqStream = https.request(options, (resp) => {
+            let data = '';
+            resp.on('data', (chunk) => { data += chunk; });
+            resp.on('end', () => {
+                try {
+                    const parsed = JSON.parse(data);
+                    if (resp.statusCode >= 200 && resp.statusCode < 300) resolve(parsed);
+                    else reject(new Error(parsed.error ? parsed.error.description : 'Razorpay API error'));
+                } catch (e) { reject(e); }
+            });
+        });
+        reqStream.on('error', reject);
+        reqStream.write(payload);
+        reqStream.end();
+    });
+}
+
+app.post('/api/payments/razorpay/order', async (req, res) => {
+    if (!process.env.PAYMENT_API_KEY || !process.env.PAYMENT_API_SECRET) {
+        return res.status(501).json({ error: 'Payment keys Render Environment mein set nahi hain (PAYMENT_API_KEY / PAYMENT_API_SECRET).' });
+    }
+    const { amount, currency, receipt } = req.body || {};
+    if (!(amount > 0)) return res.status(400).json({ error: 'Sahi amount bhejein.' });
+    try {
+        const order = await razorpayRequest('/v1/orders', {
+            amount: Math.round(amount * 100), // paise mein
+            currency: currency || 'INR',
+            receipt: receipt || ('rcpt_' + Date.now())
+        });
+        res.json({ orderId: order.id, amount: order.amount, currency: order.currency, key: process.env.PAYMENT_API_KEY });
+    } catch (e) {
+        res.status(502).json({ error: 'Razorpay order banane mein error: ' + e.message });
+    }
 });
 
-/* ============================================================
-   HRMS SALARY
-   ============================================================ */
-app.get('/api/hrms-salary/claims', async (req, res) => {
-  try {
-    const [rows] = await db.query('SELECT * FROM salary_claims ORDER BY id DESC');
-    res.json(rows);
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.post('/api/hrms-salary/claims', async (req, res) => {
-  try {
-    const { userId, role, amount } = req.body;
-    const [result] = await db.query('INSERT INTO salary_claims (user_id, role, amount, data) VALUES (?,?,?,?)',
-      [userId || (req.user && req.user.username) || '', role || '', amount || 0, JSON.stringify(req.body)]);
-    res.json({ success: true, id: result.insertId });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.post('/api/hrms-salary/claims/:id/approve', async (req, res) => {
-  try {
-    await db.query("UPDATE salary_claims SET status='approved' WHERE id=?", [req.params.id]);
+app.post('/api/payments/razorpay/verify', (req, res) => {
+    const secret = process.env.PAYMENT_API_SECRET;
+    if (!secret) return res.status(501).json({ error: 'PAYMENT_API_SECRET Render Environment mein set nahi hai.' });
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+        return res.status(400).json({ error: 'Order ID, Payment ID aur Signature teeno zaroori hain.' });
+    }
+    const expected = crypto.createHmac('sha256', secret)
+        .update(razorpay_order_id + '|' + razorpay_payment_id)
+        .digest('hex');
+    if (expected !== razorpay_signature) {
+        return res.status(400).json({ error: 'Payment verify nahi hua — signature match nahi hui.' });
+    }
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.post('/api/hrms-salary/claims/:id/reject', async (req, res) => {
-  try {
-    await db.query("UPDATE salary_claims SET status='rejected', reason=? WHERE id=?",
-      [req.body.reason || '', req.params.id]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.get('/api/hrms-salary/slips', async (req, res) => {
-  try {
-    const [rows] = await db.query('SELECT * FROM hrms_slips ORDER BY id DESC');
-    res.json(rows);
-  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-/* ---------------------------------------------------------
-   Generic fallback (purani /api/save/:table, /api/get/:table
-   style calls agar kahin aur use ho rahi ho, unke liye)
-   --------------------------------------------------------- */
-app.post('/api/save/:table', async (req, res) => {
-  try {
-    const t = req.params.table.replace(/[^a-zA-Z0-9_]/g, '');
-    await db.query(
-      `CREATE TABLE IF NOT EXISTS \`${t}\` (id INT AUTO_INCREMENT PRIMARY KEY, data JSON, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`
+// ══════════════════════════════════════════════════════════════════
+// 📱 SMS — OTP/notification bhejne ke liye. Key kabhi code mein nahi —
+//   Render Environment se aati hai: SMS_API_KEY (+ optional SMS_SENDER_ID).
+//   Neeche wala provider URL ek generic placeholder hai (Fast2SMS jaisa
+//   pattern) — apne asli SMS provider (Fast2SMS/MSG91/Twilio/etc) ke
+//   hisaab se path/params thoda badalna pad sakta hai.
+// ══════════════════════════════════════════════════════════════════
+function sendSms(mobile, message) {
+    return new Promise((resolve, reject) => {
+        const apiKey = process.env.SMS_API_KEY;
+        if (!apiKey) return reject(new Error('SMS_API_KEY Render Environment mein set nahi hai.'));
+        const params = new URLSearchParams({
+            authorization: apiKey,
+            route: 'q',
+            message,
+            numbers: mobile,
+            sender_id: process.env.SMS_SENDER_ID || 'LIBRBK'
+        });
+        https.get('https://www.fast2sms.com/dev/bulkV2?' + params.toString(), (resp) => {
+            let data = '';
+            resp.on('data', (c) => { data += c; });
+            resp.on('end', () => resolve(data));
+        }).on('error', reject);
+    });
+}
+
+app.post('/api/sms/send', async (req, res) => {
+    const { mobile, message } = req.body || {};
+    if (!mobile || !message) return res.status(400).json({ error: 'mobile aur message zaroori hain.' });
+    if (!process.env.SMS_API_KEY) return res.status(501).json({ error: 'SMS_API_KEY Render Environment mein set nahi hai.' });
+    try {
+        await sendSms(mobile, message);
+        res.json({ success: true });
+    } catch (e) {
+        res.status(502).json({ error: 'SMS bhejne mein error: ' + e.message });
+    }
+});
+
+// Agent student-collect transaction (create → pending; HRMS verify/reject)
+app.post('/api/payments/student-transaction', (req, res) => {
+    const { agentId, amount } = req.body || {};
+    if (!agentId || !(amount > 0)) return res.status(400).json({ error: 'agentId and a positive amount are required' });
+    const txnId = 'TXN' + Date.now();
+    db.query(
+        'INSERT INTO transactions (id, agentId, studentId, amount, status, data) VALUES (?,?,?,?,?,?)',
+        [txnId, agentId, req.body.studentId || null, amount, 'pending', JSON.stringify(req.body)],
+        (err) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            res.status(201).json({ txnId });
+        }
     );
-    await db.query(`INSERT INTO \`${t}\` (data) VALUES (?)`, [JSON.stringify(req.body)]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
 });
-app.get('/api/get/:table', async (req, res) => {
-  try {
-    const t = req.params.table.replace(/[^a-zA-Z0-9_]/g, '');
-    const [rows] = await db.query(`SELECT * FROM \`${t}\``);
-    res.json({ success: true, data: rows });
-  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+app.post('/api/payments/transactions/:id/verify', (req, res) => {
+    const id = req.params.id;
+    db.query("SELECT * FROM transactions WHERE id=? AND status='pending'", [id], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!rows || !rows.length) return res.status(404).json({ error: 'Transaction pending nahi mila.' });
+        const t = rows[0];
+        db.query("UPDATE transactions SET status='verified' WHERE id=?", [id], () => {
+            db.query(
+                `INSERT INTO agent_wallets (agentId, approved_balance, total_earned) VALUES (?,?,?)
+                 ON DUPLICATE KEY UPDATE approved_balance = approved_balance + VALUES(approved_balance),
+                                          total_earned = total_earned + VALUES(total_earned)`,
+                [t.agentId, t.amount, t.amount],
+                (wErr) => {
+                    if (wErr) return res.status(500).json({ error: 'DB error: ' + wErr.message });
+                    res.json({ success: true, txnId: id });
+                }
+            );
+        });
+    });
+});
+app.post('/api/payments/transactions/:id/reject', (req, res) => {
+    db.query("UPDATE transactions SET status='rejected', reason=? WHERE id=?", [(req.body || {}).reason || '', req.params.id], (err) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json({ success: true });
+    });
 });
 
-/* ---------------------------------------------------------
-   Start
-   --------------------------------------------------------- */
-const PORT = process.env.PORT || 3000;
-initTables()
-  .then(() => {
-    app.listen(PORT, () => console.log(`🚀 Server chalu hua port ${PORT} par`));
-  })
-  .catch(err => {
-    console.error('❌ Table setup fail hua:', err.message);
-    // DB na milne par bhi server start kar dete hain taaki /api/health
-    // kaam kare aur error jald pata chal jaaye (Cloud Run logs me dikhega)
-    app.listen(PORT, () => console.log(`⚠️  Server chalu (DB error ke saath) port ${PORT} par`));
-  });
+// ══════════════════════════════════════════════════════════════════
+// 🧾 HRMS SALARY — slips (admin-generated) + claims (staff self-submit,
+//   agent/admin verify → wallet se deduct karke payslip)
+// ══════════════════════════════════════════════════════════════════
+app.get('/api/hrms-salary/slips', (req, res) => {
+    db.query('SELECT * FROM hrms_salary_slips ORDER BY created_at DESC', (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json((rows || []).map(r => { try { return Object.assign(JSON.parse(r.data), { id: r.id }); } catch (e) { return { id: r.id }; } }));
+    });
+});
+app.get('/api/hrms-salary/claims', (req, res) => {
+    db.query('SELECT * FROM hrms_salary_claims ORDER BY created_at DESC', (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json((rows || []).map(r => { try { return Object.assign(JSON.parse(r.data), { id: r.id, status: r.status }); } catch (e) { return { id: r.id, status: r.status }; } }));
+    });
+});
+app.post('/api/hrms-salary/claims', (req, res) => {
+    const claim = req.body || {};
+    const id = claim.id || ('CLM' + Date.now());
+    db.query(
+        'INSERT INTO hrms_salary_claims (id, empId, status, netAmount, data) VALUES (?,?,?,?,?)',
+        [id, claim.empId || null, 'pending', claim.net || 0, JSON.stringify(claim)],
+        (err) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            res.status(201).json({ id });
+        }
+    );
+});
+// Staff claim → Agent verifies (deduct agent wallet)
+app.post('/api/wallet/salary-claims/:id/verify', (req, res) => {
+    const auth = getAuthUser(req);
+    const agentId = auth ? auth.username : (req.body && req.body.agentId);
+    if (!agentId) return res.status(401).json({ error: 'Agent identity nahi mili — dobara login karein.' });
+    db.query("SELECT * FROM hrms_salary_claims WHERE id=? AND status='pending'", [req.params.id], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!rows || !rows.length) return res.status(404).json({ error: 'Claim pending nahi mila.' });
+        const c = rows[0];
+        db.query('SELECT approved_balance FROM agent_wallets WHERE agentId=?', [agentId], (wErr, wRows) => {
+            if (wErr) return res.status(500).json({ error: 'DB error: ' + wErr.message });
+            const balance = wRows && wRows.length ? Number(wRows[0].approved_balance) : 0;
+            if (balance < Number(c.netAmount)) return res.status(400).json({ error: 'Aapke Wallet mein paise kam hain.' });
+            const transferDueBy = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+            db.query('UPDATE agent_wallets SET approved_balance = approved_balance - ? WHERE agentId=?', [c.netAmount, agentId], () => {
+                db.query("UPDATE hrms_salary_claims SET status='pending_admin', agentId=? WHERE id=?", [agentId, c.id], (uErr) => {
+                    if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
+                    res.json({ walletDeductedAmount: c.netAmount, transferDueBy });
+                });
+            });
+        });
+    });
+});
+// Admin final approve → generates payslip
+app.post('/api/hrms-salary/claims/:id/approve', (req, res) => {
+    db.query("SELECT * FROM hrms_salary_claims WHERE id=? AND (status='pending' OR status='pending_admin')", [req.params.id], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!rows || !rows.length) return res.status(400).json({ error: 'Yeh claim pending nahi hai (already processed).' });
+        const c = rows[0];
+        db.query("UPDATE hrms_salary_claims SET status='approved' WHERE id=?", [c.id], () => {
+            const slipId = 'SLP' + Date.now();
+            db.query('INSERT INTO hrms_salary_slips (id, empId, data) VALUES (?,?,?)', [slipId, c.empId, c.data], (sErr) => {
+                if (sErr) return res.status(500).json({ error: 'DB error: ' + sErr.message });
+                res.json({ netAmount: c.netAmount, slipId });
+            });
+        });
+    });
+});
+app.post('/api/hrms-salary/claims/:id/reject', (req, res) => {
+    db.query("UPDATE hrms_salary_claims SET status='rejected' WHERE id=? AND status IN ('pending','pending_admin')", [req.params.id], (err, result) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!result.affectedRows) return res.status(400).json({ error: 'Yeh claim pending nahi hai (already processed).' });
+        res.json({ success: true });
+    });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 👛 AGENT WALLET — balance, withdrawals, direct-collect payments
+//   NOTE: identity JWT token ke 'username' se aati hai (Agent login ke
+//   /auth/login bridge se). Production mein isse asli agentId se map
+//   karna behtar hoga agar dono alag ho sakte hain.
+// ══════════════════════════════════════════════════════════════════
+function requireAgentId(req, res) {
+    const auth = getAuthUser(req);
+    const agentId = auth ? auth.username : null;
+    if (!agentId) { res.status(401).json({ error: 'Login session nahi mila — dobara login karein.' }); return null; }
+    return agentId;
+}
+
+app.get('/api/wallet/me', (req, res) => {
+    const agentId = requireAgentId(req, res); if (!agentId) return;
+    db.query('SELECT * FROM agent_wallets WHERE agentId=?', [agentId], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json(rows && rows.length ? rows[0] : { approved_balance: 0, pending_balance: 0, total_earned: 0 });
+    });
+});
+app.get('/api/wallet/my-salary-payments', (req, res) => {
+    const agentId = requireAgentId(req, res); if (!agentId) return;
+    db.query("SELECT * FROM hrms_salary_claims WHERE agentId=? AND status IN ('pending_admin','approved') ORDER BY created_at DESC", [agentId], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json((rows || []).map(r => { try { return Object.assign(JSON.parse(r.data), { amount: r.netAmount }); } catch (e) { return { amount: r.netAmount }; } }));
+    });
+});
+app.get('/api/wallet/withdrawals/mine', (req, res) => {
+    const agentId = requireAgentId(req, res); if (!agentId) return;
+    db.query('SELECT * FROM wallet_withdrawals WHERE agentId=? ORDER BY created_at DESC', [agentId], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json(rows || []);
+    });
+});
+app.get('/api/wallet/my-direct-payments', (req, res) => {
+    const agentId = requireAgentId(req, res); if (!agentId) return;
+    db.query('SELECT * FROM wallet_direct_payments WHERE agentId=? ORDER BY created_at DESC', [agentId], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json(rows || []);
+    });
+});
+app.post('/api/wallet/withdraw', (req, res) => {
+    const agentId = requireAgentId(req, res); if (!agentId) return;
+    const { amount, accName, bankName, accNo, ifsc, agentName } = req.body || {};
+    if (!(amount > 0)) return res.status(400).json({ error: 'Sahi amount daalein.' });
+    db.query('SELECT approved_balance FROM agent_wallets WHERE agentId=?', [agentId], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        const balance = rows && rows.length ? Number(rows[0].approved_balance) : 0;
+        if (balance < amount) return res.status(400).json({ error: 'Aapke Withdrawable Balance se zyada amount hai — kam amount daalein.' });
+        db.query('UPDATE agent_wallets SET approved_balance = approved_balance - ?, pending_balance = pending_balance + ? WHERE agentId=?', [amount, amount, agentId], (uErr) => {
+            if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
+            db.query(
+                'INSERT INTO wallet_withdrawals (agentId, agentName, amount, accName, bankName, accNo, ifsc, status) VALUES (?,?,?,?,?,?,?,\'pending\')',
+                [agentId, agentName || '', amount, accName, bankName, accNo, ifsc],
+                (insErr) => {
+                    if (insErr) return res.status(500).json({ error: 'DB error: ' + insErr.message });
+                    res.status(201).json({ success: true });
+                }
+            );
+        });
+    });
+});
+// Admin: list all withdrawals + approve/reject
+app.get('/api/wallet/withdrawals', (req, res) => {
+    db.query('SELECT * FROM wallet_withdrawals ORDER BY created_at DESC', (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json(rows || []);
+    });
+});
+app.post('/api/wallet/withdrawal/:id/process', (req, res) => {
+    const { action, reason } = req.body || {};
+    db.query("SELECT * FROM wallet_withdrawals WHERE id=? AND status='pending'", [req.params.id], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!rows || !rows.length) return res.status(404).json({ error: 'Withdrawal pending nahi mila.' });
+        const w = rows[0];
+        if (action === 'approve') {
+            db.query("UPDATE wallet_withdrawals SET status='paid' WHERE id=?", [w.id], () => {
+                db.query('UPDATE agent_wallets SET pending_balance = pending_balance - ? WHERE agentId=?', [w.amount, w.agentId], (uErr) => {
+                    if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
+                    res.json({ success: true });
+                });
+            });
+        } else {
+            // reject → refund back to approved_balance
+            db.query("UPDATE wallet_withdrawals SET status='rejected', reason=? WHERE id=?", [reason || '', w.id], () => {
+                db.query('UPDATE agent_wallets SET pending_balance = pending_balance - ?, approved_balance = approved_balance + ? WHERE agentId=?', [w.amount, w.amount, w.agentId], (uErr) => {
+                    if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
+                    res.json({ success: true });
+                });
+            });
+        }
+    });
+});
+// Admin: student→agent direct-collect payments summary (today/month)
+app.get('/api/wallet/agent-direct-payments', (req, res) => {
+    db.query(
+        `SELECT
+            SUM(CASE WHEN DATE(created_at)=CURDATE() THEN amount ELSE 0 END) AS today_total,
+            SUM(CASE WHEN DATE(created_at)=CURDATE() THEN 1 ELSE 0 END) AS today_count,
+            SUM(CASE WHEN YEAR(created_at)=YEAR(CURDATE()) AND MONTH(created_at)=MONTH(CURDATE()) THEN amount ELSE 0 END) AS month_total,
+            SUM(CASE WHEN YEAR(created_at)=YEAR(CURDATE()) AND MONTH(created_at)=MONTH(CURDATE()) THEN 1 ELSE 0 END) AS month_count
+         FROM wallet_direct_payments`,
+        (err, rows) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            const r = (rows && rows[0]) || {};
+            res.json({
+                today: { total: Number(r.today_total) || 0, count: Number(r.today_count) || 0 },
+                month: { total: Number(r.month_total) || 0, count: Number(r.month_count) || 0 }
+            });
+        }
+    );
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 🧾 MATERIAL BILLS/INVOICES (Anmol_material_entry_secure.html)
+// ══════════════════════════════════════════════════════════════════
+app.post('/api/material/bills', (req, res) => {
+    const body = req.body || {};
+    const ownerUserId = body.ownerUserId;
+    if (!ownerUserId) return res.status(400).json({ error: 'ownerUserId zaroori hai.' });
+    db.query('INSERT INTO material_bills (ownerUserId, data) VALUES (?,?)', [ownerUserId, JSON.stringify(body)], (err, result) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.status(201).json({ id: result.insertId });
+    });
+});
+app.get('/api/material/bills', (req, res) => {
+    const ownerUserId = req.query.ownerUserId;
+    const sql = ownerUserId ? 'SELECT * FROM material_bills WHERE ownerUserId=? ORDER BY savedAt DESC' : 'SELECT * FROM material_bills ORDER BY savedAt DESC';
+    db.query(sql, ownerUserId ? [ownerUserId] : [], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json((rows || []).map(r => { try { return Object.assign(JSON.parse(r.data), { id: r.id, savedAt: r.savedAt }); } catch (e) { return { id: r.id, savedAt: r.savedAt }; } }));
+    });
+});
+app.put('/api/material/bills/:id', (req, res) => {
+    db.query('SELECT data FROM material_bills WHERE id=?', [req.params.id], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!rows || !rows.length) return res.status(404).json({ error: 'Bill nahi mila.' });
+        let merged = {};
+        try { merged = JSON.parse(rows[0].data); } catch (e) {}
+        Object.assign(merged, req.body || {});
+        db.query('UPDATE material_bills SET data=? WHERE id=?', [JSON.stringify(merged), req.params.id], (uErr) => {
+            if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
+            res.json({ success: true });
+        });
+    });
+});
+app.delete('/api/material/bills/:id', (req, res) => {
+    db.query('DELETE FROM material_bills WHERE id=?', [req.params.id], (err) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json({ success: true });
+    });
+});
+
+// Basic Routes
+app.get('/', (req, res) => {
+    res.send('Library App Backend is running successfully!');
+});
+
+// 🆕 HEALTH CHECK ROUTE — frontend ka status dot (Admin/Agent/HRMS/Student
+// portal ke '☁️ Render' indicator) isi route ko har 10 second mein poll
+// karta hai (API_BASE + '/health' → '/api/health'). Pehle ye route missing
+// tha, isliye fetch 404 deta tha aur dot hamesha red rehta tha.
+app.get('/api/health', (req, res) => {
+    res.json({
+        status: 'ok',
+        running: true,
+        db: db ? 'configured' : 'not configured',
+        timestamp: new Date().toISOString()
+    });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 🛡️ SAFETY NET — yeh sabse aakhri mein aata hai (upar ke SAARE routes
+//   define ho jaane ke baad — isliye /api/health jaisi cheezein isse
+//   pehle hi match ho jaati hain, yeh sirf bacha hua traffic pakadta hai).
+//   Kaam: kabhi bhi frontend ko HTML na mile, hamesha JSON hi mile —
+//   chahe route na mila ho, chahe upload fail hua ho, chahe koi aur
+//   unexpected error aaya ho. Isi wajah se "Unexpected token '<',
+//   <!DOCTYPE" jaisi errors dobara kabhi nahi aayengi.
+// ══════════════════════════════════════════════════════════════════
+
+// 1) Koi bhi /api/* route jo upar define nahi hua — HTML 404 ki jagah JSON 404
+app.use('/api', (req, res) => {
+    res.status(404).json({ error: 'Yeh API route maujood nahi hai: ' + req.method + ' ' + req.originalUrl });
+});
+
+// 2) Global error handler — Multer errors (file bahut badi/galat field name)
+//    aur koi bhi anya crash yahan pakda jaata hai, JSON ki tarah bheja jaata hai
+app.use((err, req, res, next) => {
+    console.error('❌ Unhandled error:', err && err.message);
+    if (err && err.name === 'MulterError') {
+        let msg = 'File upload mein error: ' + err.message;
+        if (err.code === 'LIMIT_FILE_SIZE') msg = 'File bahut badi hai (max 20MB allowed).';
+        return res.status(400).json({ error: msg });
+    }
+    res.status(500).json({ error: (err && err.message) || 'Server mein anjaan error aaya.' });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 🛡️ PROCESS-LEVEL SAFETY NET — agar kahin bhi (kisi bhi route ke
+//   db.query callback, bcrypt, jwt, waghera mein) koi unexpected error
+//   throw ho jaaye jo upar wale error-handler tak nahi pahunch paata
+//   (kyunki woh sirf route ke andar wale synchronous throws pakadta
+//   hai, deeply-nested async callbacks ke throws nahi), to NORMALLY
+//   Node.js poora process crash kar deta — matlab TURANT us waqt jo
+//   bhi user site use kar raha ho, sabke liye "Failed to fetch" (server
+//   se koi jawab hi nahi) aa jaata, jab tak Render dobara restart na kare.
+//   Ab aisi koi bhi crash sirf LOG hogi, server chalta rahega — sirf
+//   wahi ek request fail hogi, baaki poori site chalti rahegi.
+// ══════════════════════════════════════════════════════════════════
+process.on('uncaughtException', (err) => {
+    console.error('🚨 UNCAUGHT EXCEPTION (server crash rukwaya gaya):', err && err.stack);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('🚨 UNHANDLED PROMISE REJECTION (server crash rukwaya gaya):', reason);
+});
+
+// Start Server
+app.listen(PORT, () => {
+    console.log(`🚀 Server chalu hua port ${PORT} par`);
+});
