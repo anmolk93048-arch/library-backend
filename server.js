@@ -9,6 +9,11 @@ const multer = require('multer'); // 🆕 file upload (Hero image/Logo/APK) ke l
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// 🆕 Render ek reverse proxy ke peeche chalta hai — isके bina Express hamesha
+// req.protocol ko 'http' samajhta, jisse upload-file wala absolute URL galti se
+// 'http://...' ban jaata (jo HTTPS Netlify site par mixed-content block ho jaata).
+app.set('trust proxy', 1);
+
 // Middleware
 app.use(cors({
     origin: '*',
@@ -588,8 +593,15 @@ app.post('/api/site-content/upload-file', upload.single('file'), (req, res) => {
         (err, result) => {
             if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
             const id = result.insertId;
-            const url = '/api/site-content/file/' + id;
-            res.status(201).json({ url, path: url, name: req.file.originalname, size: req.file.size });
+            // 🆕 FIX: pehle sirf relative path ('/api/site-content/file/123') bheja
+            // jaata tha. Netlify (index.html) par jab is link par click hota tha,
+            // to browser use apne HI domain (netlify.app) se jodta tha — Render se
+            // nahi — isliye "Page not found" aata tha. Ab poora ABSOLUTE URL
+            // (asli Render domain ke saath) bheja jaata hai, taaki link kahin se
+            // bhi click karo, hamesha sahi jagah (Render backend) khule.
+            const path = '/api/site-content/file/' + id;
+            const absoluteUrl = req.protocol + '://' + req.get('host') + path;
+            res.status(201).json({ url: absoluteUrl, path: absoluteUrl, name: req.file.originalname, size: req.file.size });
         }
     );
 });
