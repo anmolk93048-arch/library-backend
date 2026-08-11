@@ -4,6 +4,7 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const multer = require('multer'); // 🆕 file upload (Hero image/Logo/APK) ke liye
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -263,8 +264,23 @@ db.getConnection((err, connection) => {
                 note VARCHAR(500),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
+        `, (e) => { if (e) console.error('❌ wallet_direct_payments table error:', e.message); });
+
+        // 🆕 Uploaded files (Hero image / Logo / APK / login-page HTML) — DB mein
+        // hi blob ki tarah store hote hain, kyunki Render ka disk restart/redeploy
+        // pe reset ho jaata hai (isliye seedhe filesystem pe save karna safe nahi).
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS site_files (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                folder VARCHAR(100),
+                name VARCHAR(255),
+                mime VARCHAR(150),
+                size INT,
+                data LONGBLOB,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
         `, (e) => {
-            if (e) console.error('❌ wallet_direct_payments table error:', e.message);
+            if (e) console.error('❌ site_files table error:', e.message);
             connection.release();
             console.log('✅ Saari tables ready — koi bhi feature ab 404 nahi dega.');
         });
@@ -547,6 +563,46 @@ app.get('/api/site-data', (req, res) => {
             try { out[r.key] = JSON.parse(r.value); } catch (e) { out[r.key] = r.value; }
         });
         res.json(out);
+    });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 📤 FILE UPLOAD — Hero image / Logo / Login-page HTML / APK
+//   (Admin_panel_Login.html ka gcsUploadFile() isi route ko call karta
+//   hai; pehle yeh route missing tha isliye Express ka default 404 HTML
+//   aata tha aur frontend "Unexpected token '<'..." error deta tha.)
+//   Memory mein hi rakha jaata hai (Multer memoryStorage) aur seedhe MySQL
+//   mein blob ki tarah save hota hai — Render ke ephemeral disk pe nahi,
+//   isliye redeploy/restart hone par bhi file gayab nahi hoti.
+// ══════════════════════════════════════════════════════════════════
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB max
+
+app.post('/api/site-content/upload-file', upload.single('file'), (req, res) => {
+    const auth = getAuthUser(req);
+    if (!auth || String(auth.role).toLowerCase() !== 'admin') return res.status(401).json({ error: 'Sirf Admin login se hi file upload ho sakti hai.' });
+    if (!req.file) return res.status(400).json({ error: 'Koi file mili nahi (form field ka naam "file" hona chahiye).' });
+    const folder = req.body.folder || 'misc';
+    db.query(
+        'INSERT INTO site_files (folder, name, mime, size, data) VALUES (?,?,?,?,?)',
+        [folder, req.file.originalname, req.file.mimetype, req.file.size, req.file.buffer],
+        (err, result) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            const id = result.insertId;
+            const url = '/api/site-content/file/' + id;
+            res.status(201).json({ url, path: url, name: req.file.originalname, size: req.file.size });
+        }
+    );
+});
+
+// File serve — jo bhi upload-file se URL mila tha, wahi yahan se file waapas deta hai
+app.get('/api/site-content/file/:id', (req, res) => {
+    db.query('SELECT name, mime, data FROM site_files WHERE id=?', [req.params.id], (err, rows) => {
+        if (err) return res.status(500).send('DB error');
+        if (!rows || !rows.length) return res.status(404).send('File not found');
+        const f = rows[0];
+        res.set('Content-Type', f.mime || 'application/octet-stream');
+        res.set('Content-Disposition', 'inline; filename="' + f.name + '"');
+        res.send(f.data);
     });
 });
 
@@ -1007,6 +1063,33 @@ app.get('/api/health', (req, res) => {
         db: db ? 'configured' : 'not configured',
         timestamp: new Date().toISOString()
     });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 🛡️ SAFETY NET — yeh sabse aakhri mein aata hai (upar ke SAARE routes
+//   define ho jaane ke baad — isliye /api/health jaisi cheezein isse
+//   pehle hi match ho jaati hain, yeh sirf bacha hua traffic pakadta hai).
+//   Kaam: kabhi bhi frontend ko HTML na mile, hamesha JSON hi mile —
+//   chahe route na mila ho, chahe upload fail hua ho, chahe koi aur
+//   unexpected error aaya ho. Isi wajah se "Unexpected token '<',
+//   <!DOCTYPE" jaisi errors dobara kabhi nahi aayengi.
+// ══════════════════════════════════════════════════════════════════
+
+// 1) Koi bhi /api/* route jo upar define nahi hua — HTML 404 ki jagah JSON 404
+app.use('/api', (req, res) => {
+    res.status(404).json({ error: 'Yeh API route maujood nahi hai: ' + req.method + ' ' + req.originalUrl });
+});
+
+// 2) Global error handler — Multer errors (file bahut badi/galat field name)
+//    aur koi bhi anya crash yahan pakda jaata hai, JSON ki tarah bheja jaata hai
+app.use((err, req, res, next) => {
+    console.error('❌ Unhandled error:', err && err.message);
+    if (err && err.name === 'MulterError') {
+        let msg = 'File upload mein error: ' + err.message;
+        if (err.code === 'LIMIT_FILE_SIZE') msg = 'File bahut badi hai (max 20MB allowed).';
+        return res.status(400).json({ error: msg });
+    }
+    res.status(500).json({ error: (err && err.message) || 'Server mein anjaan error aaya.' });
 });
 
 // Start Server
