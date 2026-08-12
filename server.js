@@ -528,7 +528,7 @@ app.post('/api/auth/login', (req, res) => {
 // 🗄️ GENERIC KEY-VALUE STORES — admin-entities / blob / site-data
 //   (Admin Panel ke FBSync.pull/push isi se judte hain)
 // ══════════════════════════════════════════════════════════════════
-const ENTITY_KEYS = ['admins', 'staff', 'agents', 'students'];
+const ENTITY_KEYS = ['admins', 'staff', 'agents', 'students', 'agent_logins'];
 const BLOB_KEYS = ['settings', 'activity', 'notices', 'mem_plans', 'members',
     'hrms_registrations', 'staff_att', 'leave_requests', 'agent_plans', 'agent_payments',
     'razorpay_config', 'sms_api_config'];
@@ -894,6 +894,92 @@ app.get('/api/hrms-salary/slips', (req, res) => {
         res.json((rows || []).map(r => { try { return Object.assign(JSON.parse(r.data), { id: r.id }); } catch (e) { return { id: r.id }; } }));
     });
 });
+// ══════════════════════════════════════════════════════════════════
+// 💳 SUBSCRIPTION RENEWAL — Agent_login.html ka AGENT_APPLY_RENEWAL()
+//   pehle 3 alag-alag Firebase calls karta tha (agent update, students
+//   bulk-activate, payment history log). Ab yeh sab EK hi backend call
+//   mein ho jaata hai — 'agents'/'students' (kv_admin_entities) aur
+//   'agent_payments' (kv_blob) ko seedhe DB mein update karke.
+// ══════════════════════════════════════════════════════════════════
+app.post('/api/payment/update', (req, res) => {
+    const { username, planId, planName, days, price, mode, refId } = req.body || {};
+    if (!username || !(Number(days) > 0)) return res.status(400).json({ error: 'username aur days zaroori hain.' });
+
+    db.query("SELECT value FROM kv_admin_entities WHERE `key`='agents'", (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        let agents = [];
+        try { agents = rows && rows.length ? JSON.parse(rows[0].value) : []; } catch (e) {}
+        const idx = agents.findIndex(a => a && a.username && String(a.username).toLowerCase() === String(username).toLowerCase());
+        if (idx === -1) return res.status(404).json({ error: 'Agent record nahi mila. Admin se contact karein.' });
+
+        const a = agents[idx];
+        const today = new Date(); today.setHours(0, 0, 0, 0);
+        const curExp = a.subExpiry ? new Date(a.subExpiry) : null;
+        const base = (curExp && curExp > today) ? curExp : today;
+        const newExp = new Date(base); newExp.setDate(newExp.getDate() + Number(days));
+        const newExpStr = newExp.toISOString().split('T')[0];
+        const newStartStr = today.toISOString().split('T')[0];
+        agents[idx] = Object.assign({}, a, { planId, subStart: newStartStr, subExpiry: newExpStr });
+        const agentsJson = JSON.stringify(agents);
+
+        db.query("UPDATE kv_admin_entities SET value=? WHERE `key`='agents'", [agentsJson], (uErr) => {
+            if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
+
+            // ── Is agent ke saare students ka subscription bhi turant activate karo ──
+            db.query("SELECT value FROM kv_admin_entities WHERE `key`='students'", (sErr, sRows) => {
+                let students = [];
+                try { students = sRows && sRows.length ? JSON.parse(sRows[0].value) : []; } catch (e) {}
+                let activatedCount = 0;
+                if (a.agentId && Array.isArray(students)) {
+                    students = students.map(s => {
+                        if (s && s.agentId === a.agentId) {
+                            activatedCount++;
+                            return Object.assign({}, s, { subscription_status: 'active', subscription_expiry: newExpStr });
+                        }
+                        return s;
+                    });
+                }
+                const saveStudents = (cb) => {
+                    if (!activatedCount) return cb();
+                    db.query("UPDATE kv_admin_entities SET value=? WHERE `key`='students'", [JSON.stringify(students)], () => cb());
+                };
+
+                saveStudents(() => {
+                    // ── Payment history log karo ──
+                    db.query("SELECT value FROM kv_blob WHERE `key`='agent_payments'", (pErr, pRows) => {
+                        let payments = [];
+                        try { payments = pRows && pRows.length ? JSON.parse(pRows[0].value) : []; } catch (e) {}
+                        const paymentRecord = {
+                            id: 'pay' + Date.now(), agentId: a.id, agentDbId: a.agentId, agentName: a.name,
+                            planId, planName, amount: price, mode: mode || '', note: refId ? ('Ref: ' + refId) : '',
+                            date: new Date().toLocaleString('hi-IN'), newExpiry: newExpStr
+                        };
+                        payments.push(paymentRecord);
+                        const paymentsJson = JSON.stringify(payments);
+                        db.query(
+                            "INSERT INTO kv_blob (`key`, value) VALUES ('agent_payments', ?) ON DUPLICATE KEY UPDATE value = ?",
+                            [paymentsJson, paymentsJson],
+                            (finalErr) => {
+                                if (finalErr) return res.status(500).json({ error: 'DB error: ' + finalErr.message });
+                                res.json({ subStart: newStartStr, subExpiry: newExpStr, agent: agents[idx], paymentRecord, studentsActivated: activatedCount });
+                            }
+                        );
+                    });
+                });
+            });
+        });
+    });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 🧾 STAFF SALARY SYNC — HRMS ke liye 'staff' data. Yeh route wahi
+//   'admin-entities/staff' hi hai (naya endpoint nahi banaya), taaki
+//   Admin Panel se add/edit kiya gaya staff seedhe HRMS salary-calc mein
+//   bhi reflect ho. Alag naam se alias diya gaya hai taaki frontend code
+//   mein intent saaf rahe ('/salary/sync' padhne mein samajh aata hai).
+// ══════════════════════════════════════════════════════════════════
+app.get('/api/salary/sync', (req, res) => kvGet('kv_admin_entities', 'staff', res));
+
 app.get('/api/hrms-salary/claims', (req, res) => {
     db.query('SELECT * FROM hrms_salary_claims ORDER BY created_at DESC', (err, rows) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
