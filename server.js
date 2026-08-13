@@ -283,20 +283,37 @@ db.getConnection((err, connection) => {
         // 🆕 Uploaded files (Hero image / Logo / APK / login-page HTML) — DB mein
         // hi blob ki tarah store hote hain, kyunki Render ka disk restart/redeploy
         // pe reset ho jaata hai (isliye seedhe filesystem pe save karna safe nahi).
+        // 🆕 'slug' column: login-pages jaisi cheezon ko ek FIXED, memorable URL
+        // deta hai (jaise /api/pages/agent-login) jo kabhi nahi badalta — chahe
+        // file dobara upload/update kyun na ho jaaye. Isi se poora "Dynamic
+        // Login System" bina Netlify par alag se deploy kiye kaam karta hai.
         connection.query(`
             CREATE TABLE IF NOT EXISTS site_files (
                 id INT AUTO_INCREMENT PRIMARY KEY,
+                slug VARCHAR(150) UNIQUE,
                 folder VARCHAR(100),
                 name VARCHAR(255),
                 mime VARCHAR(150),
                 size INT,
                 data LONGBLOB,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
             )
         `, (e) => {
             if (e) console.error('❌ site_files table error:', e.message);
-            connection.release();
-            console.log('✅ Saari tables ready — koi bhi feature ab 404 nahi dega.');
+            // Purani (pehle se maujood) site_files table mein 'slug' column jodo
+            // agar pehle se nahi hai — CREATE TABLE IF NOT EXISTS purani table
+            // ko khud nahi badalta.
+            connection.query(`
+                ALTER TABLE site_files ADD COLUMN slug VARCHAR(150) UNIQUE
+            `, (alterErr) => {
+                // Agar column pehle se hai to yeh error aayega — usse ignore karo
+                if (alterErr && !/Duplicate column/i.test(alterErr.message)) {
+                    console.error('❌ site_files slug column error:', alterErr.message);
+                }
+                connection.release();
+                console.log('✅ Saari tables ready — koi bhi feature ab 404 nahi dega.');
+            });
         });
     }
 });
@@ -634,31 +651,56 @@ app.get('/api/site-data', (req, res) => {
 // ══════════════════════════════════════════════════════════════════
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB max
 
+// Slug ko URL-safe banata hai: "Agent Login" → "agent-login"
+function slugify(str) {
+    return String(str || '').toLowerCase().trim()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 140);
+}
+
 app.post('/api/site-content/upload-file', upload.single('file'), (req, res) => {
     const auth = getAuthUser(req);
     if (!auth || String(auth.role).toLowerCase() !== 'admin') return res.status(401).json({ error: 'Sirf Admin login se hi file upload ho sakti hai.' });
     if (!req.file) return res.status(400).json({ error: 'Koi file mili nahi (form field ka naam "file" hona chahiye).' });
     const folder = req.body.folder || 'misc';
-    db.query(
-        'INSERT INTO site_files (folder, name, mime, size, data) VALUES (?,?,?,?,?)',
-        [folder, req.file.originalname, req.file.mimetype, req.file.size, req.file.buffer],
-        (err, result) => {
-            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
-            const id = result.insertId;
-            // 🆕 FIX: pehle sirf relative path ('/api/site-content/file/123') bheja
-            // jaata tha. Netlify (index.html) par jab is link par click hota tha,
-            // to browser use apne HI domain (netlify.app) se jodta tha — Render se
-            // nahi — isliye "Page not found" aata tha. Ab poora ABSOLUTE URL
-            // (asli Render domain ke saath) bheja jaata hai, taaki link kahin se
-            // bhi click karo, hamesha sahi jagah (Render backend) khule.
-            const path = '/api/site-content/file/' + id;
-            const absoluteUrl = req.protocol + '://' + req.get('host') + path;
-            res.status(201).json({ url: absoluteUrl, path: absoluteUrl, name: req.file.originalname, size: req.file.size });
-        }
-    );
+    const slug = req.body.slug ? slugify(req.body.slug) : null;
+
+    const respondWithFile = (id) => {
+        // 🆕 Agar slug diya gaya hai (login-pages ke liye hamesha diya jaata hai), to
+        // URL hamesha /api/pages/<slug> hoga — yeh URL kabhi nahi badalta, chahe file
+        // dobara-dobara upload/update hoti rahe. Isi se "Dynamic Centralized Login
+        // System" banta hai: Netlify par kabhi alag se file deploy nahi karni padti.
+        const path = slug ? ('/api/pages/' + slug) : ('/api/site-content/file/' + id);
+        const absoluteUrl = req.protocol + '://' + req.get('host') + path;
+        res.status(201).json({ url: absoluteUrl, path: absoluteUrl, name: req.file.originalname, size: req.file.size, slug: slug || null });
+    };
+
+    if (slug) {
+        // 🆕 UPSERT by slug: pehli baar INSERT, agli baar isi slug par UPDATE —
+        // taaki "Agent Login" dobara upload karne par bhi URL wahi purana hi rahe.
+        db.query(
+            `INSERT INTO site_files (slug, folder, name, mime, size, data) VALUES (?,?,?,?,?,?)
+             ON DUPLICATE KEY UPDATE folder=VALUES(folder), name=VALUES(name), mime=VALUES(mime), size=VALUES(size), data=VALUES(data)`,
+            [slug, folder, req.file.originalname, req.file.mimetype, req.file.size, req.file.buffer],
+            (err, result) => {
+                if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+                respondWithFile(result.insertId);
+            }
+        );
+    } else {
+        db.query(
+            'INSERT INTO site_files (folder, name, mime, size, data) VALUES (?,?,?,?,?)',
+            [folder, req.file.originalname, req.file.mimetype, req.file.size, req.file.buffer],
+            (err, result) => {
+                if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+                respondWithFile(result.insertId);
+            }
+        );
+    }
 });
 
-// File serve — jo bhi upload-file se URL mila tha, wahi yahan se file waapas deta hai
+// File serve by numeric ID (purane links ke backward-compatibility ke liye)
 app.get('/api/site-content/file/:id', (req, res) => {
     db.query('SELECT name, mime, data FROM site_files WHERE id=?', [req.params.id], (err, rows) => {
         if (err) return res.status(500).send('DB error');
@@ -667,6 +709,35 @@ app.get('/api/site-content/file/:id', (req, res) => {
         res.set('Content-Type', f.mime || 'application/octet-stream');
         res.set('Content-Disposition', 'inline; filename="' + f.name + '"');
         res.send(f.data);
+    });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 🌐 CENTRALIZED DYNAMIC PAGE ROUTE — yeh hi woh "catch-all" route hai
+//   jo aapne maanga tha. Admin/Agent/HRMS/Student/Invoice — koi bhi
+//   login page ho, sabka HTML ab isi EK route se, database se seedha
+//   nikal kar serve hota hai. Naya login role add karna ho to bas Admin
+//   Panel se naya HTML upload karo (slug ke saath) — turant
+//   /api/pages/<slug> par live ho jaata hai, Netlify par kuch bhi
+//   deploy karne ki zaroorat NAHI.
+// ══════════════════════════════════════════════════════════════════
+app.get('/api/pages/:slug', (req, res) => {
+    db.query('SELECT name, mime, data FROM site_files WHERE slug=?', [req.params.slug], (err, rows) => {
+        if (err) return res.status(500).send('DB error: ' + err.message);
+        if (!rows || !rows.length) return res.status(404).send('Yeh page abhi upload nahi hua hai: /' + req.params.slug);
+        const f = rows[0];
+        res.set('Content-Type', f.mime || 'text/html');
+        res.set('Content-Disposition', 'inline; filename="' + f.name + '"');
+        res.send(f.data);
+    });
+});
+
+// Admin Panel ke "Login Dropdown Manager" mein sabhi upload-ho-chuke pages
+// ki list dikhane ke liye (slug + naam + kab update hua)
+app.get('/api/pages', (req, res) => {
+    db.query("SELECT slug, name, mime, size, updated_at FROM site_files WHERE slug IS NOT NULL ORDER BY updated_at DESC", (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json(rows || []);
     });
 });
 
