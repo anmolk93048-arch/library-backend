@@ -15,16 +15,24 @@ const PORT = process.env.PORT || 3000;
 app.set('trust proxy', 1);
 
 // Middleware
-// 🆕 FIX: pehle origin: '*' (wildcard) tha. Yeh un requests ke liye kaam nahi
-// karta jo 'credentials: include' bhejti hain (jaise Material Portal ka login
-// form) — browser ka niyam hai ki wildcard '*' aur credentials ek saath nahi
-// chal sakte, aur puri request "blocked by CORS policy" karke reject kar deta
-// hai. Ab yahan har request ke asli origin ko hi wapas bhej diya jaata hai
-// (reflect), jo dono tarah ki requests (credentials ke saath/bina) ke saath
-// kaam karta hai — chahe request Netlify se aaye, kisi bhi custom uploaded
-// HTML page se, ya kahin se bhi.
+// 🆕 FIX: ab CORS sirf EXPLICITLY allowed origins ke liye khulta hai — sirf
+// 'https://digitallibraryanmollive.netlify.app' (aapki Netlify site). Pehle
+// har origin allow ho jaata tha (reflect); ab sirf yeh list wale hi.
+// NOTE: agar future mein koi custom domain jodna ho, ya Netlify deploy-preview
+// URLs (jaise https://deploy-preview-3--digitallibraryanmollive.netlify.app)
+// bhi allow karne hon, to bas neeche is array mein add kar dein.
+const ALLOWED_ORIGINS = [
+    'https://digitallibraryanmollive.netlify.app'
+];
 app.use(cors({
-    origin: function (origin, callback) { callback(null, true); },
+    origin: function (origin, callback) {
+        // Server-to-server / curl / Postman jaisi requests mein origin header
+        // hota hi nahi — unhe allow karo (koi browser CORS risk nahi hai).
+        if (!origin) return callback(null, true);
+        if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+        console.warn('❌ CORS blocked origin:', origin);
+        return callback(new Error('CORS: is domain se access allowed nahi hai — ' + origin));
+    },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
