@@ -15,14 +15,19 @@ const PORT = process.env.PORT || 3000;
 app.set('trust proxy', 1);
 
 // Middleware
-// 🆕 FIX: ab CORS sirf EXPLICITLY allowed origins ke liye khulta hai — sirf
-// 'https://digitallibraryanmollive.netlify.app' (aapki Netlify site). Pehle
-// har origin allow ho jaata tha (reflect); ab sirf yeh list wale hi.
+// 🆕 FIX: ab CORS sirf EXPLICITLY allowed origins ke liye khulta hai. Do
+// origins allowed hain: (1) Netlify site — jahan index.html/Admin Panel
+// hain, aur (2) Render ka apna backend domain — kyunki ab kuch login pages
+// (jaise Material Portal) '/api/pages/<slug>' se Render se hi seedhe serve
+// hote hain, aur woh page bhi isi backend ko API call karta hai. Render ka
+// apna domain whitelist mein na hone ki wajah se pehle yeh exact CORS error
+// aa raha tha.
 // NOTE: agar future mein koi custom domain jodna ho, ya Netlify deploy-preview
 // URLs (jaise https://deploy-preview-3--digitallibraryanmollive.netlify.app)
 // bhi allow karne hon, to bas neeche is array mein add kar dein.
 const ALLOWED_ORIGINS = [
-    'https://digitallibraryanmollive.netlify.app'
+    'https://digitallibraryanmollive.netlify.app',
+    'https://library-backend-4efk.onrender.com'
 ];
 app.use(cors({
     origin: function (origin, callback) {
