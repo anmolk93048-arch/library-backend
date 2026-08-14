@@ -1303,10 +1303,35 @@ app.post('/api/material/bills', (req, res) => {
                 res.status(200).json({ id: existingId, updated: true });
             });
         } else {
-            db.query('INSERT INTO material_bills (ownerUserId, data) VALUES (?,?)', [ownerUserId, JSON.stringify(body)], (err, result) => {
-                if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
-                res.status(201).json({ id: result.insertId, updated: false });
-            });
+            const doInsert = (retryDone) => {
+                db.query('INSERT INTO material_bills (ownerUserId, data) VALUES (?,?)', [ownerUserId, JSON.stringify(body)], (err, result) => {
+                    // 🆕 SELF-HEAL FIX: agar Render par abhi bhi purana table (bina
+                    // AUTO_INCREMENT wala 'id') chal raha ho, to startup ka ALTER
+                    // TABLE fix kabhi silently fail ho sakta hai (jaise DB user ke
+                    // paas ALTER privilege na ho, ya woh fix us waqt DB se connect
+                    // hi na ho paaya ho). Pehle is wajah se "Field 'id' doesn't
+                    // have a default value" seedha user tak chala jaata tha. Ab
+                    // agar yehi specific error aaye, to hum turant khud ALTER
+                    // TABLE chala kar 'id' ko AUTO_INCREMENT bana dete hain aur
+                    // INSERT ko ek baar khud-b-khud retry karte hain — user ko
+                    // dobara try karne ki zaroorat nahi padti.
+                    if (err && !retryDone && /doesn't have a default value/i.test(err.message)) {
+                        console.warn('⚠️ material_bills.id AUTO_INCREMENT missing tha — auto-fix karke retry kar rahe hain...');
+                        db.query('ALTER TABLE material_bills MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT', (fixErr) => {
+                            if (fixErr) {
+                                console.error('❌ material_bills id auto-fix fail hua:', fixErr.message);
+                                return res.status(500).json({ error: 'DB error: ' + err.message });
+                            }
+                            console.log('✅ material_bills.id AUTO_INCREMENT auto-fix ho gaya, ab retry kar rahe hain');
+                            doInsert(true);
+                        });
+                        return;
+                    }
+                    if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+                    res.status(201).json({ id: result.insertId, updated: false });
+                });
+            };
+            doInsert(false);
         }
     });
 });
