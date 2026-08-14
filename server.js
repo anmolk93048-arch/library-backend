@@ -172,7 +172,22 @@ db.getConnection((err, connection) => {
                 data LONGTEXT,
                 savedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        `, (e) => { if (e) console.error('❌ material_bills table error:', e.message); });
+        `, (e) => {
+            if (e) console.error('❌ material_bills table error:', e.message);
+            // 🆕 FIX: agar material_bills table pehle se (kisi purane version se)
+            // maujood thi bina 'ownerUserId' column ke, to CREATE TABLE IF NOT
+            // EXISTS use apne aap nahi jodta — isi wajah se "Unknown column
+            // 'ownerUserId'" error aata tha. Yeh ALTER TABLE use safely jod deta
+            // hai (agar pehle se hai to error ignore kar diya jaata hai).
+            connection.query(
+                `ALTER TABLE material_bills ADD COLUMN ownerUserId VARCHAR(50) NOT NULL DEFAULT ''`,
+                (alterErr) => {
+                    if (alterErr && !/Duplicate column/i.test(alterErr.message)) {
+                        console.error('❌ material_bills ownerUserId column error:', alterErr.message);
+                    }
+                }
+            );
+        });
 
         // 🆕 Generic key-value stores — admin-entities (admins/staff/agents/students
         // arrays) aur blob (settings/notices/mem_plans/... — routes/blob.js jaisa)
