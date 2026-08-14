@@ -198,11 +198,58 @@ db.getConnection((err, connection) => {
             // 'id' bheja hi nahi jaata) "Field 'id' doesn't have a default
             // value" error aata tha. MODIFY se use safely AUTO_INCREMENT bana
             // diya jaata hai (agar pehle se hai to yeh no-op hi rehta hai).
+            //
+            // 🆕 DEBUG: neeche pehle 'id' column ka current state (SHOW COLUMNS)
+            // print karte hain, phir ALTER chalate hain aur uska result bhi
+            // detail mein print karte hain (sirf .message nahi, poora error
+            // object — code, errno, sqlState, sqlMessage). Isse Render Logs
+            // mein saaf dikhega ki ALTER exactly kyun fail ho raha hai (jaise
+            // DB user ke paas ALTER privilege na hona, ya koi aur reason) —
+            // aur ALTER chalne ke BAAD ka actual column state bhi confirm ho
+            // jaayega.
+            connection.query("SHOW COLUMNS FROM material_bills WHERE Field='id'", (showErr, showRows) => {
+                if (showErr) {
+                    console.error('🔍 DEBUG material_bills.id — SHOW COLUMNS (before ALTER) fail hua:', showErr.message);
+                } else {
+                    console.log('🔍 DEBUG material_bills.id — ALTER se PEHLE current column state:', JSON.stringify(showRows && showRows[0]));
+                }
+            });
+
             connection.query(
                 "ALTER TABLE material_bills MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT",
                 (idErr) => {
-                    if (idErr) console.error('❌ material_bills id AUTO_INCREMENT fix error:', idErr.message);
-                    else console.log('✅ material_bills.id AUTO_INCREMENT confirmed');
+                    if (idErr) {
+                        // Poora error object print karo — sirf .message nahi.
+                        // MySQL errors mein idErr.code (jaise 'ER_TABLEACCESS_DENIED_ERROR',
+                        // 'ER_DUP_ENTRY'), idErr.errno, idErr.sqlState, idErr.sqlMessage
+                        // sabse zyada useful hote hain root-cause dhoondne ke liye.
+                        console.error('❌ DEBUG material_bills id AUTO_INCREMENT ALTER FAIL HUA:');
+                        console.error('   → message   :', idErr.message);
+                        console.error('   → code      :', idErr.code);
+                        console.error('   → errno     :', idErr.errno);
+                        console.error('   → sqlState  :', idErr.sqlState);
+                        console.error('   → sqlMessage:', idErr.sqlMessage);
+                        console.error('   → poora error object:', JSON.stringify(idErr, Object.getOwnPropertyNames(idErr)));
+                    } else {
+                        console.log('✅ material_bills.id AUTO_INCREMENT ALTER command safaltapoorvak chal gaya (ya pehle se AUTO_INCREMENT tha)');
+                        // ALTER ke baad dobara SHOW COLUMNS chalao taaki confirm ho
+                        // jaaye ki 'id' column ab sach mein AUTO_INCREMENT hai ya nahi
+                        // (kabhi-kabhi query "safal" dikhti hai lekin actual DB state
+                        // expected na ho, jaise koi trigger/permission quirk ho).
+                        connection.query("SHOW COLUMNS FROM material_bills WHERE Field='id'", (showErr2, showRows2) => {
+                            if (showErr2) {
+                                console.error('🔍 DEBUG material_bills.id — SHOW COLUMNS (after ALTER) fail hua:', showErr2.message);
+                            } else {
+                                const extra = showRows2 && showRows2[0] && showRows2[0].Extra;
+                                console.log('🔍 DEBUG material_bills.id — ALTER ke BAAD current column state:', JSON.stringify(showRows2 && showRows2[0]));
+                                if (!extra || extra.indexOf('auto_increment') === -1) {
+                                    console.error('⚠️ DEBUG: ALTER "safal" bola lekin AUTO_INCREMENT ab bhi column ke Extra field mein nahi hai! Yeh dhyan se dekhein.');
+                                } else {
+                                    console.log('✅ DEBUG: confirmed — id column ka Extra field mein "auto_increment" maujood hai.');
+                                }
+                            }
+                        });
+                    }
                 }
             );
         });
@@ -572,6 +619,50 @@ app.post('/api/material/login', (req, res) => {
     } catch (outerErr) {
         console.error('❌ /material/login outer error:', outerErr.message);
         res.status(500).json({ error: 'Login request mein error aaya: ' + outerErr.message });
+    }
+});
+
+// 9) 🆕 Material user: login ke baad khud apna mobile number badalna
+//   (Anmol_material_entry.html ke "मोबाइल नंबर बदलें" form se yahan aata
+//   hai). Yeh route login-time wale JWT token se hi authenticate karta
+//   hai — koi bhi doosre user ka mobile isse nahi badla ja sakta. Update
+//   hote hi wahi row (material_users.mobile) badalti hai jise Admin Panel
+//   bhi seedhe '/api/material/users' se padhta hai — isliye Admin ko bhi
+//   turant naya number dikhne lagta hai. Frontend is response ke baad
+//   khud user ko turant logout kar deta hai, taaki agli baar login sirf
+//   naye mobile number se ho.
+app.post('/api/material/change-mobile', (req, res) => {
+    try {
+        const auth = getAuthUser(req);
+        if (!auth || auth.role !== 'material_user' || !auth.userId) {
+            return res.status(401).json({ error: 'Session expire ho gaya hai. Kripya dobara login karein.' });
+        }
+        const rawMobile = req.body && req.body.newMobile;
+        const newMobile = rawMobile != null ? String(rawMobile).trim() : '';
+        const digitsOnly = newMobile.replace(/\D/g, '');
+        if (digitsOnly.length !== 10) {
+            return res.status(400).json({ error: 'Kripya sahi 10-digit mobile number dalein.' });
+        }
+        db.query('SELECT id, mobile FROM material_users WHERE userId = ?', [auth.userId], (err, rows) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            if (!rows || !rows.length) return res.status(404).json({ error: 'Yeh User ID nahi mila.' });
+            const me = rows[0];
+            // Duplicate check: koi aur material user isi mobile (last 10 digits
+            // ke aadhar par, taaki formatting ka farq na pade) se registered na ho.
+            db.query('SELECT id, mobile FROM material_users WHERE id != ?', [me.id], (dupErr, others) => {
+                if (dupErr) return res.status(500).json({ error: 'DB error: ' + dupErr.message });
+                const clash = (others || []).some(r => String(r.mobile || '').replace(/\D/g, '').slice(-10) === digitsOnly);
+                if (clash) {
+                    return res.status(409).json({ error: 'Yeh mobile number pehle se kisi aur ID se registered hai.' });
+                }
+                db.query('UPDATE material_users SET mobile = ? WHERE id = ?', [digitsOnly, me.id], (uErr) => {
+                    if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
+                    res.json({ success: true, mobile: digitsOnly });
+                });
+            });
+        });
+    } catch (e) {
+        res.status(500).json({ error: 'Server mein error aaya: ' + e.message });
     }
 });
 
