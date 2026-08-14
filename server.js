@@ -175,18 +175,24 @@ db.getConnection((err, connection) => {
         `, (e) => {
             if (e) console.error('❌ material_bills table error:', e.message);
             // 🆕 FIX: agar material_bills table pehle se (kisi purane version se)
-            // maujood thi bina 'ownerUserId' column ke, to CREATE TABLE IF NOT
-            // EXISTS use apne aap nahi jodta — isi wajah se "Unknown column
-            // 'ownerUserId'" error aata tha. Yeh ALTER TABLE use safely jod deta
-            // hai (agar pehle se hai to error ignore kar diya jaata hai).
-            connection.query(
-                `ALTER TABLE material_bills ADD COLUMN ownerUserId VARCHAR(50) NOT NULL DEFAULT ''`,
-                (alterErr) => {
+            // maujood thi bina in columns ke, to CREATE TABLE IF NOT EXISTS unhe
+            // apne aap nahi jodta — isi wajah se "Unknown column 'ownerUserId'"
+            // phir "Unknown column 'data'" jaisi errors ek-ek karke aa rahi thi.
+            // Ab teeno zaroori columns (ownerUserId, data, savedAt) ek saath,
+            // safely ensure kar diye jaate hain — jo pehle se hai use ignore
+            // kar diya jaata hai (Duplicate column error).
+            const ensureColumns = [
+                "ALTER TABLE material_bills ADD COLUMN ownerUserId VARCHAR(50) NOT NULL DEFAULT ''",
+                "ALTER TABLE material_bills ADD COLUMN data LONGTEXT",
+                "ALTER TABLE material_bills ADD COLUMN savedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+            ];
+            ensureColumns.forEach((sql) => {
+                connection.query(sql, (alterErr) => {
                     if (alterErr && !/Duplicate column/i.test(alterErr.message)) {
-                        console.error('❌ material_bills ownerUserId column error:', alterErr.message);
+                        console.error('❌ material_bills column error:', alterErr.message, '| SQL:', sql);
                     }
-                }
-            );
+                });
+            });
         });
 
         // 🆕 Generic key-value stores — admin-entities (admins/staff/agents/students
@@ -1301,9 +1307,17 @@ app.get('/api/material/bills', (req, res) => {
     });
 });
 app.put('/api/material/bills/:id', (req, res) => {
-    db.query('SELECT data FROM material_bills WHERE id=?', [req.params.id], (err, rows) => {
+    db.query('SELECT ownerUserId, data FROM material_bills WHERE id=?', [req.params.id], (err, rows) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
         if (!rows || !rows.length) return res.status(404).json({ error: 'Bill nahi mila.' });
+        // 🆕 SECURITY FIX: pehle koi bhi logged-in material user, ID guess
+        // karke doosre user ka bill edit kar sakta tha. Ab check karte hain
+        // ki jo ownerUserId request mein bheja gaya hai, wahi is bill ka
+        // asli malik ho — warna edit reject ho jaayega.
+        const requestOwnerId = (req.body || {}).ownerUserId;
+        if (requestOwnerId && rows[0].ownerUserId && requestOwnerId !== rows[0].ownerUserId) {
+            return res.status(403).json({ error: 'Yeh bill aapka nahi hai — edit nahi kar sakte.' });
+        }
         let merged = {};
         try { merged = JSON.parse(rows[0].data); } catch (e) {}
         Object.assign(merged, req.body || {});
