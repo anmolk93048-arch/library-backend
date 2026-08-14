@@ -193,6 +193,18 @@ db.getConnection((err, connection) => {
                     }
                 });
             });
+            // 🆕 FIX: purani table mein 'id' column PRIMARY KEY to tha, lekin
+            // AUTO_INCREMENT nahi tha — isliye naya row insert karte waqt (jab
+            // 'id' bheja hi nahi jaata) "Field 'id' doesn't have a default
+            // value" error aata tha. MODIFY se use safely AUTO_INCREMENT bana
+            // diya jaata hai (agar pehle se hai to yeh no-op hi rehta hai).
+            connection.query(
+                "ALTER TABLE material_bills MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT",
+                (idErr) => {
+                    if (idErr) console.error('❌ material_bills id AUTO_INCREMENT fix error:', idErr.message);
+                    else console.log('✅ material_bills.id AUTO_INCREMENT confirmed');
+                }
+            );
         });
 
         // 🆕 Generic key-value stores — admin-entities (admins/staff/agents/students
