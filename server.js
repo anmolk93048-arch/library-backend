@@ -1248,9 +1248,33 @@ app.post('/api/material/bills', (req, res) => {
     const body = req.body || {};
     const ownerUserId = body.ownerUserId;
     if (!ownerUserId) return res.status(400).json({ error: 'ownerUserId zaroori hai.' });
-    db.query('INSERT INTO material_bills (ownerUserId, data) VALUES (?,?)', [ownerUserId, JSON.stringify(body)], (err, result) => {
-        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
-        res.status(201).json({ id: result.insertId });
+    // 🆕 FIX: pehle yahan har save par HAMESHA naya row INSERT hota tha —
+    // chahe wahi Bill No dobara save kiya jaaye. Frontend isi behavior ki
+    // ummeed karta hai ki ownerUserId + billNo match hone par UPDATE ho,
+    // naya duplicate row na bane. Ab pehle check karte hain ki isi user ka
+    // isi Bill No wala record pehle se hai kya — agar hai to UPDATE, nahi to
+    // naya INSERT.
+    const billNo = body.billNo || null;
+    const findExisting = (cb) => {
+        if (!billNo) return cb(null); // Bill No khaali hai — hamesha naya bill
+        db.query(
+            "SELECT id FROM material_bills WHERE ownerUserId=? AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.billNo'))=? LIMIT 1",
+            [ownerUserId, billNo],
+            (err, rows) => cb(err ? null : (rows && rows[0] ? rows[0].id : null))
+        );
+    };
+    findExisting((existingId) => {
+        if (existingId) {
+            db.query('UPDATE material_bills SET data=? WHERE id=?', [JSON.stringify(body), existingId], (uErr) => {
+                if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
+                res.status(200).json({ id: existingId, updated: true });
+            });
+        } else {
+            db.query('INSERT INTO material_bills (ownerUserId, data) VALUES (?,?)', [ownerUserId, JSON.stringify(body)], (err, result) => {
+                if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+                res.status(201).json({ id: result.insertId, updated: false });
+            });
+        }
     });
 });
 app.get('/api/material/bills', (req, res) => {
