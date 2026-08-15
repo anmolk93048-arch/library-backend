@@ -98,6 +98,46 @@ if (missingEnv.length) {
 }
 
 // Test Database Connection & Tables Setup
+// 🆕 UNIVERSAL FIX: "Field 'id' doesn't have a default value"
+//   In sabhi tables ke INSERT query mein 'id' kabhi bheja hi nahi jaata —
+//   MySQL khud agla number AUTO_INCREMENT se generate karta hai. Agar
+//   production DB purani/legacy schema se bana ho (jisme 'id' PRIMARY
+//   KEY to tha, AUTO_INCREMENT nahi), to yeh exact error aata hai. Neeche
+//   di gayi list un sabhi tables ki hai jinka 'id' column isi tarah
+//   AUTO_INCREMENT hona chahiye — startup par (neeche) aur zaroorat padne
+//   par route-level retry me bhi (insertWithIdHeal) inhe fix kiya jaata hai.
+const AUTO_INCREMENT_ID_TABLES = [
+    'users', 'material_user_requests', 'material_users', 'material_bills',
+    'attendance_records', 'fee_payments', 'site_files',
+    'wallet_withdrawals', 'wallet_direct_payments'
+];
+
+// Route-level safety net: normal INSERT try karta hai; agar phir bhi
+// "doesn't have a default value" error aaye (jaise startup ka ALTER us
+// waqt DB se connect na ho paaya ho, ya koi race-condition ho), to turant
+// khud us table ka 'id' AUTO_INCREMENT bana kar ek baar insert retry
+// karta hai — user ko kabhi error dikhta hi nahi.
+function insertWithIdHeal(sql, params, tableName, callback) {
+    db.query(sql, params, (err, result) => {
+        if (err && /doesn't have a default value/i.test(err.message)) {
+            console.warn('⚠️ ' + tableName + '.id AUTO_INCREMENT missing tha — auto-fix karke retry kar rahe hain...');
+            db.query(
+                'ALTER TABLE `' + tableName + '` MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT',
+                (fixErr) => {
+                    if (fixErr) {
+                        console.error('❌ ' + tableName + '.id auto-fix fail hua:', fixErr.message);
+                        return callback(err, null); // original error hi wapas bhejo
+                    }
+                    console.log('✅ ' + tableName + '.id AUTO_INCREMENT auto-fix ho gaya, ab retry kar rahe hain');
+                    db.query(sql, params, callback); // ek baar retry
+                }
+            );
+            return;
+        }
+        callback(err, result);
+    });
+}
+
 db.getConnection((err, connection) => {
     if (err) {
         console.error('❌ Table setup fail hua: ' + err.message);
@@ -404,6 +444,29 @@ db.getConnection((err, connection) => {
                 if (alterErr && !/Duplicate column/i.test(alterErr.message)) {
                     console.error('❌ site_files slug column error:', alterErr.message);
                 }
+
+                // 🆕 UNIVERSAL FIX: "Field 'id' doesn't have a default value"
+                // Yeh error tab aata hai jab kisi table ka 'id' column PRIMARY
+                // KEY to hai, lekin AUTO_INCREMENT nahi hai — aisa tab hota hai
+                // jab table kisi purane/legacy schema se bani thi. INSERT query
+                // mein hum kabhi 'id' bhejte hi nahi (MySQL khud agla number
+                // generate karta hai), isliye AUTO_INCREMENT hona zaroori hai.
+                // material_bills ke liye yeh fix upar (line ~196) pehle se hai —
+                // yahan wahi fix baaki sabhi id-based tables ke liye bhi ek saath
+                // chala diya jaata hai, taaki koi bhi table isi error se na atke.
+                AUTO_INCREMENT_ID_TABLES.forEach((t) => {
+                    connection.query(
+                        'ALTER TABLE `' + t + '` MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT',
+                        (idErr) => {
+                            if (idErr) {
+                                console.error('❌ ' + t + '.id ko AUTO_INCREMENT banane mein error:', idErr.message);
+                            } else {
+                                console.log('✅ ' + t + '.id AUTO_INCREMENT confirm ho gaya (ya pehle se tha).');
+                            }
+                        }
+                    );
+                });
+
                 connection.release();
                 console.log('✅ Saari tables ready — koi bhi feature ab 404 nahi dega.');
             });
@@ -449,9 +512,10 @@ app.post('/api/material/register', (req, res) => {
         if (rows && rows.length) {
             return res.status(409).json({ error: 'Yeh mobile number pehle se registered ya pending mein hai.' });
         }
-        db.query(
+        insertWithIdHeal(
             'INSERT INTO material_user_requests (name, village, address, email, mobile, photo) VALUES (?,?,?,?,?,?)',
             [name, village, address, email, mobile, photo || null],
+            'material_user_requests',
             (insErr) => {
                 if (insErr) return res.status(500).json({ error: 'DB error: ' + insErr.message });
                 res.status(201).json({ success: true });
@@ -479,10 +543,11 @@ app.post('/api/material/requests/:id/approve', (req, res) => {
             if (idErr) return res.status(500).json({ error: 'DB error: ' + idErr.message });
             const plainPassword = genMuPassword();
             const passwordHash = bcrypt.hashSync(plainPassword, 10);
-            db.query(
+            insertWithIdHeal(
                 `INSERT INTO material_users (userId, name, village, address, email, mobile, photo, password_hash, status)
                  VALUES (?,?,?,?,?,?,?,?, 'active')`,
                 [userId, r.name, r.village, r.address, r.email, r.mobile, r.photo, passwordHash],
+                'material_users',
                 (insErr) => {
                     if (insErr) return res.status(500).json({ error: 'DB error: ' + insErr.message });
                     db.query('DELETE FROM material_user_requests WHERE id = ?', [reqId], () => {
@@ -523,10 +588,11 @@ app.post('/api/material/users', (req, res) => {
         genMaterialUserId((idErr, userId) => {
             if (idErr) return res.status(500).json({ error: 'DB error: ' + idErr.message });
             const passwordHash = bcrypt.hashSync(genMuPassword(), 10);
-            db.query(
+            insertWithIdHeal(
                 `INSERT INTO material_users (userId, name, village, mobile, photo, password_hash, status)
                  VALUES (?,?,?,?,?,?,?)`,
                 [userId, name, village, mobile, photo || null, passwordHash, status || 'active'],
+                'material_users',
                 (insErr) => {
                     if (insErr) return res.status(500).json({ error: 'DB error: ' + insErr.message });
                     res.status(201).json({ userId });
@@ -816,19 +882,21 @@ app.post('/api/site-content/upload-file', upload.single('file'), (req, res) => {
     if (slug) {
         // 🆕 UPSERT by slug: pehli baar INSERT, agli baar isi slug par UPDATE —
         // taaki "Agent Login" dobara upload karne par bhi URL wahi purana hi rahe.
-        db.query(
+        insertWithIdHeal(
             `INSERT INTO site_files (slug, folder, name, mime, size, data) VALUES (?,?,?,?,?,?)
              ON DUPLICATE KEY UPDATE folder=VALUES(folder), name=VALUES(name), mime=VALUES(mime), size=VALUES(size), data=VALUES(data)`,
             [slug, folder, req.file.originalname, req.file.mimetype, req.file.size, req.file.buffer],
+            'site_files',
             (err, result) => {
                 if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
                 respondWithFile(result.insertId);
             }
         );
     } else {
-        db.query(
+        insertWithIdHeal(
             'INSERT INTO site_files (folder, name, mime, size, data) VALUES (?,?,?,?,?)',
             [folder, req.file.originalname, req.file.mimetype, req.file.size, req.file.buffer],
+            'site_files',
             (err, result) => {
                 if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
                 respondWithFile(result.insertId);
@@ -897,11 +965,12 @@ app.post('/api/attendance', (req, res) => {
             try { mergedRecords = Object.assign(JSON.parse(rows[0].records || '{}'), records || {}); } catch (e) {}
             try { mergedSelfies = Object.assign(JSON.parse(rows[0].selfies || '{}'), selfies || {}); } catch (e) {}
         }
-        db.query(
+        insertWithIdHeal(
             `INSERT INTO attendance_records (date, batch, records, selfies, markedBy, savedAt)
              VALUES (?,?,?,?,?,?)
              ON DUPLICATE KEY UPDATE records=VALUES(records), selfies=VALUES(selfies), markedBy=VALUES(markedBy), savedAt=VALUES(savedAt)`,
             [date, batch, JSON.stringify(mergedRecords), JSON.stringify(mergedSelfies), markedBy || '', savedAt || new Date().toISOString()],
+            'attendance_records',
             (insErr) => {
                 if (insErr) return res.status(500).json({ error: 'DB error: ' + insErr.message });
                 res.json({ success: true });
@@ -916,9 +985,10 @@ app.post('/api/attendance', (req, res) => {
 app.post('/api/payments/fee', (req, res) => {
     const { studentId, amount, mode, note, status } = req.body || {};
     if (!studentId || !(amount > 0)) return res.status(400).json({ error: 'studentId aur amount zaroori hain.' });
-    db.query(
+    insertWithIdHeal(
         'INSERT INTO fee_payments (studentId, amount, mode, note, status) VALUES (?,?,?,?,?)',
         [studentId, amount, mode || 'cash', note || '', status || 'paid'],
+        'fee_payments',
         (err, result) => {
             if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
             res.status(201).json({ id: result.insertId });
@@ -1303,9 +1373,10 @@ app.post('/api/wallet/withdraw', (req, res) => {
         if (balance < amount) return res.status(400).json({ error: 'Aapke Withdrawable Balance se zyada amount hai — kam amount daalein.' });
         db.query('UPDATE agent_wallets SET approved_balance = approved_balance - ?, pending_balance = pending_balance + ? WHERE agentId=?', [amount, amount, agentId], (uErr) => {
             if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
-            db.query(
+            insertWithIdHeal(
                 'INSERT INTO wallet_withdrawals (agentId, agentName, amount, accName, bankName, accNo, ifsc, status) VALUES (?,?,?,?,?,?,?,\'pending\')',
                 [agentId, agentName || '', amount, accName, bankName, accNo, ifsc],
+                'wallet_withdrawals',
                 (insErr) => {
                     if (insErr) return res.status(500).json({ error: 'DB error: ' + insErr.message });
                     res.status(201).json({ success: true });
