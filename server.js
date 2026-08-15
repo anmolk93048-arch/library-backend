@@ -1428,6 +1428,19 @@ app.post('/api/material/bills', (req, res) => {
 });
 app.get('/api/material/bills', (req, res) => {
     const ownerUserId = req.query.ownerUserId;
+    // 🆕 MULTI-USER INVOICE + ADMIN VIEW: jab ownerUserId diya gaya ho, wahi
+    // (self-service) behavior pehle jaisa hai — material user apne khud ke
+    // bills dekh sakta hai. Lekin jab ownerUserId NAHI diya jaata (matlab
+    // "sabhi users ke sabhi invoices" wali request — Admin Panel ka naya
+    // 'All Invoices' page), tab yeh sirf logged-in Admin session (JWT
+    // role='admin') ko hi allow karta hai, taaki koi bhi random request
+    // saare users ka invoice data na khींच sake.
+    if (!ownerUserId) {
+        const auth = getAuthUser(req);
+        if (!auth || String(auth.role).toLowerCase() !== 'admin') {
+            return res.status(401).json({ error: 'Sirf Admin login se hi sabhi users ke invoices dekhe ja sakte hain.' });
+        }
+    }
     const sql = ownerUserId ? 'SELECT * FROM material_bills WHERE ownerUserId=? ORDER BY savedAt DESC' : 'SELECT * FROM material_bills ORDER BY savedAt DESC';
     db.query(sql, ownerUserId ? [ownerUserId] : [], (err, rows) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
