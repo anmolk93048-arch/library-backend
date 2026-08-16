@@ -64,6 +64,31 @@ function getAuthUser(req) {
     }
 }
 
+// 🆕 PERMANENT FIX for "Block karne par bhi user login/kaam karta rehta hai":
+//   Login-time JWT token 7 din tak valid rehta hai aur usme sirf userId/role
+//   store hota hai — agar Admin kisi CURRENTLY LOGGED-IN user ko beech mein
+//   block kar de, to purana token khud-ba-khud invalid nahi hota (JWT ka yehi
+//   design hai)। Isliye material-user ke har sensitive action (bill save/edit/
+//   delete, mobile number change) par yeh middleware turant DB se current
+//   status dobara check karta hai — token valid hone ke bawajood block hote
+//   hi agli hi request se turant 403 mil jaata hai, session khatam hone ka
+//   intezaar nahi karna padta.
+function requireActiveMaterialUser(req, res, next) {
+    const auth = getAuthUser(req);
+    if (!auth || auth.role !== 'material_user' || !auth.userId) {
+        // Token na ho / kisi aur role ka ho — purana behavior hi chalne do
+        // (yeh routes pehle bhi bina is check ke kaam karte the).
+        return next();
+    }
+    db.query('SELECT status FROM material_users WHERE userId = ?', [auth.userId], (err, rows) => {
+        if (err) return next(); // DB check fail ho jaaye to request block mat karo
+        if (rows && rows[0] && rows[0].status === 'blocked') {
+            return res.status(403).json({ error: 'Yeh ID admin dwara block kar di gayi hai. Aap ab is portal ka istemal nahi kar sakte.' });
+        }
+        next();
+    });
+}
+
 /* --------------------------------------------------------------------------
    Database Connection (Cloud SQL & MySQL 8.4 Compatible)
 -------------------------------------------------------------------------- */
@@ -202,6 +227,35 @@ db.getConnection((err, connection) => {
         `;
         connection.query(createMaterialUsersTable, (tableErr) => {
             if (tableErr) console.error('❌ material_users table error:', tableErr.message);
+
+            // 🆕 PERMANENT FIX: "Edit/Save karne par DB update nahi hota" aur
+            // "Block karne par bhi user login karta rehta hai" — dono issues
+            // ki asli wajah yehi thi: production ka material_users table isi
+            // CREATE TABLE se PEHLE ban chuka tha (jab address/email/status/
+            // blockedReason columns abhi is table mein add hi nahi hue the).
+            // 'CREATE TABLE IF NOT EXISTS' aisi PURANI table ko kabhi nahi
+            // badalta — isliye jab bhi Admin Panel PUT /material/users/:id
+            // se in columns ko update karne ki koshish karta, MySQL turant
+            // "Unknown column" error deta tha aur poora Save/Block silently
+            // fail ho jaata tha. Neeche har column ke liye ALTER TABLE chalaya
+            // jaata hai — agar column pehle se hai to bas "Duplicate column"
+            // error ignore ho jaata hai (koi nuksaan nahi), agar missing hai
+            // to turant jud jaata hai.
+            const materialUsersColumnFixes = [
+                "ALTER TABLE material_users ADD COLUMN address VARCHAR(500)",
+                "ALTER TABLE material_users ADD COLUMN email VARCHAR(255)",
+                "ALTER TABLE material_users ADD COLUMN status VARCHAR(20) DEFAULT 'active'",
+                "ALTER TABLE material_users ADD COLUMN blockedReason VARCHAR(500)",
+                "ALTER TABLE material_users ADD COLUMN photo LONGTEXT",
+                "ALTER TABLE material_users ADD COLUMN password_hash VARCHAR(255)"
+            ];
+            materialUsersColumnFixes.forEach((sql) => {
+                connection.query(sql, (colErr) => {
+                    if (colErr && !/Duplicate column/i.test(colErr.message)) {
+                        console.error('❌ material_users column fix error (' + sql + '):', colErr.message);
+                    }
+                });
+            });
         });
 
         // 🆕 Material bills/invoices (Anmol_material_entry_secure.html)
@@ -697,7 +751,7 @@ app.post('/api/material/login', (req, res) => {
 //   turant naya number dikhne lagta hai. Frontend is response ke baad
 //   khud user ko turant logout kar deta hai, taaki agli baar login sirf
 //   naye mobile number se ho.
-app.post('/api/material/change-mobile', (req, res) => {
+app.post('/api/material/change-mobile', requireActiveMaterialUser, (req, res) => {
     try {
         const auth = getAuthUser(req);
         if (!auth || auth.role !== 'material_user' || !auth.userId) {
@@ -1439,7 +1493,7 @@ app.get('/api/wallet/agent-direct-payments', (req, res) => {
 // ══════════════════════════════════════════════════════════════════
 // 🧾 MATERIAL BILLS/INVOICES (Anmol_material_entry_secure.html)
 // ══════════════════════════════════════════════════════════════════
-app.post('/api/material/bills', (req, res) => {
+app.post('/api/material/bills', requireActiveMaterialUser, (req, res) => {
     const body = req.body || {};
     const ownerUserId = body.ownerUserId;
     if (!ownerUserId) return res.status(400).json({ error: 'ownerUserId zaroori hai.' });
@@ -1518,7 +1572,7 @@ app.get('/api/material/bills', (req, res) => {
         res.json((rows || []).map(r => { try { return Object.assign(JSON.parse(r.data), { id: r.id, savedAt: r.savedAt }); } catch (e) { return { id: r.id, savedAt: r.savedAt }; } }));
     });
 });
-app.put('/api/material/bills/:id', (req, res) => {
+app.put('/api/material/bills/:id', requireActiveMaterialUser, (req, res) => {
     db.query('SELECT ownerUserId, data FROM material_bills WHERE id=?', [req.params.id], (err, rows) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
         if (!rows || !rows.length) return res.status(404).json({ error: 'Bill nahi mila.' });
@@ -1539,7 +1593,7 @@ app.put('/api/material/bills/:id', (req, res) => {
         });
     });
 });
-app.delete('/api/material/bills/:id', (req, res) => {
+app.delete('/api/material/bills/:id', requireActiveMaterialUser, (req, res) => {
     db.query('DELETE FROM material_bills WHERE id=?', [req.params.id], (err) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
         res.json({ success: true });
