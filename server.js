@@ -467,6 +467,39 @@ db.getConnection((err, connection) => {
             )
         `, (e) => { if (e) console.error('❌ wallet_direct_payments table error:', e.message); });
 
+        // 🆕 Student subscription Razorpay orders — jab order create hota hai
+        // tabhi studentId/planId/days yahan save ho jaate hain, taaki verify
+        // step client se dobara yeh values na maange (jo tamper ho sakti thin)
+        // balki seedha yahi se padh kar student ko activate kare.
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS student_subscription_orders (
+                orderId VARCHAR(100) PRIMARY KEY,
+                studentId VARCHAR(100) NOT NULL,
+                planId VARCHAR(150),
+                planName VARCHAR(150),
+                days INT NOT NULL,
+                amount DECIMAL(10,2) NOT NULL,
+                status VARCHAR(20) DEFAULT 'created',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `, (e) => { if (e) console.error('❌ student_subscription_orders table error:', e.message); });
+
+        // 🆕 Agent subscription Razorpay orders — student_subscription_orders
+        // jaisa hi, taaki verify step client se plan/amount/days dobara na
+        // maange (jo tamper ho sakti thin) balki seedha yahi se padhe.
+        connection.query(`
+            CREATE TABLE IF NOT EXISTS agent_subscription_orders (
+                orderId VARCHAR(100) PRIMARY KEY,
+                username VARCHAR(100) NOT NULL,
+                planId VARCHAR(150),
+                planName VARCHAR(150),
+                days INT NOT NULL,
+                amount DECIMAL(10,2) NOT NULL,
+                status VARCHAR(20) DEFAULT 'created',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `, (e) => { if (e) console.error('❌ agent_subscription_orders table error:', e.message); });
+
         // 🆕 Uploaded files (Hero image / Logo / APK / login-page HTML) — DB mein
         // hi blob ki tarah store hote hain, kyunki Render ka disk restart/redeploy
         // pe reset ho jaata hai (isliye seedhe filesystem pe save karna safe nahi).
@@ -1037,15 +1070,43 @@ app.post('/api/attendance', (req, res) => {
 // 💳 PAYMENTS — student fee, Razorpay, agent-collect transactions
 // ══════════════════════════════════════════════════════════════════
 app.post('/api/payments/fee', (req, res) => {
-    const { studentId, amount, mode, note, status } = req.body || {};
+    // 🔒 FIX: Student_Attendance.html ka SUBMIT_FEE_PAYMENT() 'method' aur
+    // 'monthKey' bhejta tha (mode/note nahi) aur response mein poora
+    // 'payment' object expect karta tha (receipt PDF banane ke liye —
+    // date/time/studentName/method/monthKey). Backend sirf 'mode'/'note'
+    // padhta tha aur sirf {id} return karta tha, isliye 'result.payment'
+    // hamesha undefined aata tha aur fee receipt kabhi sahi se nahi banta
+    // tha. Ab dono field-naam accept hote hain aur poora payment object
+    // wapas jaata hai (DB schema badle bina).
+    const { studentId, amount, mode, method, note, status, monthKey } = req.body || {};
     if (!studentId || !(amount > 0)) return res.status(400).json({ error: 'studentId aur amount zaroori hain.' });
+    const paymentMode = mode || method || 'cash';
     insertWithIdHeal(
         'INSERT INTO fee_payments (studentId, amount, mode, note, status) VALUES (?,?,?,?,?)',
-        [studentId, amount, mode || 'cash', note || '', status || 'paid'],
+        [studentId, amount, paymentMode, note || '', status || 'paid'],
         'fee_payments',
         (err, result) => {
             if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
-            res.status(201).json({ id: result.insertId });
+            db.query("SELECT value FROM kv_admin_entities WHERE `key`='students'", (sErr, sRows) => {
+                let studentInfo = {};
+                try {
+                    const students = sRows && sRows.length ? JSON.parse(sRows[0].value) : [];
+                    const s = students.find(x => x && (x.id === studentId || x.studentId === studentId));
+                    if (s) studentInfo = { studentName: s.name, studentClass: s.cls || s.addr || '', batch: s.batch || '' };
+                } catch (e) {}
+                const now = new Date();
+                res.status(201).json({
+                    id: result.insertId,
+                    payment: Object.assign({
+                        id: result.insertId,
+                        studentId, amount, mode: paymentMode, method: paymentMode,
+                        note: note || '', status: status || 'paid',
+                        monthKey: monthKey || (now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0')),
+                        date: now.toLocaleDateString('en-IN'),
+                        time: now.toLocaleTimeString('en-IN')
+                    }, studentInfo)
+                });
+            });
         }
     );
 });
@@ -1135,6 +1196,230 @@ app.post('/api/payments/razorpay/verify', (req, res) => {
         return res.status(400).json({ error: 'Payment verify nahi hua — signature match nahi hui.' });
     }
     res.json({ success: true });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 🎓 STUDENT SUBSCRIPTION PAYMENT — Student_Attendance.html ka
+//   "Ab Payment Karein" button ab seedha in dono routes se judta hai
+//   (pehle yeh Admin Panel mein manually daale gaye ek alag Firebase
+//   'razorpay_config.orderEndpoint' URL ko call karta tha, aur payment
+//   verify + subscription-activate ek Firebase Cloud Function ke bharose
+//   chhod diya gaya tha jiska is codebase mein kahin naamo-nishaan nahi
+//   hai — isi wajah se payment ho jaane ke baad bhi student ka
+//   subscription kabhi activate nahi hota tha aur paisa kahin record
+//   bhi nahi hota tha).
+//   Ab: order isi backend (PAYMENT_API_KEY/SECRET) se banta hai, plan/
+//   days/amount yahin DB mein save hote hain (client dobara nahi bhej
+//   sakta — tamper-proof), aur verify step signature check karne ke
+//   baad seedha (1) student ka subscription_status/expiry activate
+//   karta hai aur (2) fee_payments mein record daalta hai taaki Admin
+//   ke Fee Payment History mein turant dikhe.
+// ══════════════════════════════════════════════════════════════════
+app.post('/api/payments/student-subscription/order', async (req, res) => {
+    if (!process.env.PAYMENT_API_KEY || !process.env.PAYMENT_API_SECRET) {
+        return res.status(501).json({ error: 'Payment keys Render Environment mein set nahi hain (PAYMENT_API_KEY / PAYMENT_API_SECRET).' });
+    }
+    const { studentId, amount, planId, planName, days } = req.body || {};
+    if (!studentId) return res.status(400).json({ error: 'studentId zaroori hai.' });
+    if (!(amount > 0)) return res.status(400).json({ error: 'Sahi amount bhejein.' });
+    if (!(Number(days) > 0)) return res.status(400).json({ error: 'Plan ke days zaroori hain.' });
+    try {
+        const order = await razorpayRequest('/v1/orders', {
+            amount: Math.round(amount * 100),
+            currency: 'INR',
+            receipt: 'sub_' + studentId + '_' + Date.now()
+        });
+        db.query(
+            'INSERT INTO student_subscription_orders (orderId, studentId, planId, planName, days, amount) VALUES (?,?,?,?,?,?)',
+            [order.id, studentId, planId || '', planName || '', days, amount],
+            (err) => {
+                if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+                res.json({ orderId: order.id, amount: order.amount, currency: order.currency, key: process.env.PAYMENT_API_KEY });
+            }
+        );
+    } catch (e) {
+        res.status(502).json({ error: 'Razorpay order banane mein error: ' + e.message });
+    }
+});
+
+app.post('/api/payments/student-subscription/verify', (req, res) => {
+    const secret = process.env.PAYMENT_API_SECRET;
+    if (!secret) return res.status(501).json({ error: 'PAYMENT_API_SECRET Render Environment mein set nahi hai.' });
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+        return res.status(400).json({ error: 'Order ID, Payment ID aur Signature teeno zaroori hain.' });
+    }
+    const expected = crypto.createHmac('sha256', secret)
+        .update(razorpay_order_id + '|' + razorpay_payment_id)
+        .digest('hex');
+    if (expected !== razorpay_signature) {
+        return res.status(400).json({ error: 'Payment verify nahi hua — signature match nahi hui.' });
+    }
+    db.query("SELECT * FROM student_subscription_orders WHERE orderId=? AND status='created'", [razorpay_order_id], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!rows || !rows.length) return res.status(404).json({ error: 'Yeh order pehle se process ho chuka hai ya mila nahi.' });
+        const o = rows[0];
+        db.query("UPDATE student_subscription_orders SET status='paid' WHERE orderId=?", [razorpay_order_id], () => {
+            // ── Student ka subscription_status/expiry activate karo (kv_admin_entities.students) ──
+            db.query("SELECT value FROM kv_admin_entities WHERE `key`='students'", (sErr, sRows) => {
+                if (sErr) return res.status(500).json({ error: 'DB error: ' + sErr.message });
+                let students = [];
+                try { students = sRows && sRows.length ? JSON.parse(sRows[0].value) : []; } catch (e) {}
+                const idx = students.findIndex(s => s && (s.id === o.studentId || s.studentId === o.studentId));
+                const today = new Date(); today.setHours(0, 0, 0, 0);
+                const curExp = (idx !== -1 && students[idx].subscription_expiry) ? new Date(students[idx].subscription_expiry) : null;
+                const base = (curExp && curExp > today) ? curExp : today;
+                const newExp = new Date(base); newExp.setDate(newExp.getDate() + Number(o.days));
+                const newExpStr = newExp.toISOString().split('T')[0];
+                if (idx !== -1) {
+                    students[idx] = Object.assign({}, students[idx], { subscription_status: 'active', subscription_expiry: newExpStr });
+                }
+                const saveStudents = (cb) => {
+                    if (idx === -1) return cb(); // student record admin-entities mein na mile to bhi payment record safe rahega
+                    db.query("UPDATE kv_admin_entities SET value=? WHERE `key`='students'", [JSON.stringify(students)], () => cb());
+                };
+                saveStudents(() => {
+                    // ── fee_payments mein log karo — Admin Fee History mein turant dikhega ──
+                    insertWithIdHeal(
+                        'INSERT INTO fee_payments (studentId, amount, mode, note, status) VALUES (?,?,?,?,?)',
+                        [o.studentId, o.amount, 'Razorpay', (o.planName || 'Subscription') + ' — Ref: ' + razorpay_payment_id, 'paid'],
+                        'fee_payments',
+                        (fErr) => {
+                            if (fErr) return res.status(500).json({ error: 'DB error: ' + fErr.message });
+                            res.json({ success: true, subscription_status: 'active', subscription_expiry: newExpStr });
+                        }
+                    );
+                });
+            });
+        });
+    });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 🧑‍💼 AGENT SUBSCRIPTION PAYMENT — Agent App ke "Renew" button ko
+//   ab bhi seedha isse jodna hai (dekhein PAY_AGENT_SUBSCRIPTION()).
+//   Pehle yeh Razorpay checkout bina kisi order_id ke khulta tha, aur
+//   payment 'successful' hote hi client seedha browser se Firebase
+//   likh deta tha — koi server-side verification nahi thi. Iska matlab
+//   koi bhi browser console se AGENT_APPLY_RENEWAL() ko fake refId ke
+//   saath call karke, bina paisa diye, apni subscription "renew" dikha
+//   sakta tha. Ab: order backend par plan ke SAHI price se banta hai
+//   (client jo amount bheje uska koi matlab nahi — plan seedha DB se
+//   padha jaata hai), payment signature server par verify hoti hai,
+//   aur tabhi jaake agent ki subscription + uske sabhi students ka
+//   subscription_status backend khud activate karta hai.
+// ══════════════════════════════════════════════════════════════════
+app.post('/api/payments/agent-subscription/order', async (req, res) => {
+    if (!process.env.PAYMENT_API_KEY || !process.env.PAYMENT_API_SECRET) {
+        return res.status(501).json({ error: 'Payment keys Render Environment mein set nahi hain (PAYMENT_API_KEY / PAYMENT_API_SECRET).' });
+    }
+    const { username, planId } = req.body || {};
+    if (!username) return res.status(400).json({ error: 'username zaroori hai.' });
+    if (!planId) return res.status(400).json({ error: 'planId zaroori hai.' });
+    db.query("SELECT value FROM kv_blob WHERE `key`='agent_plans'", (pErr, pRows) => {
+        if (pErr) return res.status(500).json({ error: 'DB error: ' + pErr.message });
+        let plans = [];
+        try { plans = pRows && pRows.length ? JSON.parse(pRows[0].value) : []; } catch (e) {}
+        const plan = plans.find(p => p && p.id === planId);
+        if (!plan) return res.status(404).json({ error: 'Yeh plan Admin ke paas set nahi hai.' });
+        razorpayRequest('/v1/orders', {
+            amount: Math.round(Number(plan.price) * 100),
+            currency: 'INR',
+            receipt: 'agentsub_' + username + '_' + Date.now()
+        }).then((order) => {
+            db.query(
+                'INSERT INTO agent_subscription_orders (orderId, username, planId, planName, days, amount) VALUES (?,?,?,?,?,?)',
+                [order.id, username, plan.id, plan.name || '', plan.days, plan.price],
+                (err) => {
+                    if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+                    res.json({ orderId: order.id, amount: order.amount, currency: order.currency, key: process.env.PAYMENT_API_KEY, plan: plan });
+                }
+            );
+        }).catch((e) => res.status(502).json({ error: 'Razorpay order banane mein error: ' + e.message }));
+    });
+});
+
+app.post('/api/payments/agent-subscription/verify', (req, res) => {
+    const secret = process.env.PAYMENT_API_SECRET;
+    if (!secret) return res.status(501).json({ error: 'PAYMENT_API_SECRET Render Environment mein set nahi hai.' });
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+        return res.status(400).json({ error: 'Order ID, Payment ID aur Signature teeno zaroori hain.' });
+    }
+    const expected = crypto.createHmac('sha256', secret)
+        .update(razorpay_order_id + '|' + razorpay_payment_id)
+        .digest('hex');
+    if (expected !== razorpay_signature) {
+        return res.status(400).json({ error: 'Payment verify nahi hua — signature match nahi hui.' });
+    }
+    db.query("SELECT * FROM agent_subscription_orders WHERE orderId=? AND status='created'", [razorpay_order_id], (oErr, oRows) => {
+        if (oErr) return res.status(500).json({ error: 'DB error: ' + oErr.message });
+        if (!oRows || !oRows.length) return res.status(404).json({ error: 'Yeh order pehle se process ho chuka hai ya mila nahi.' });
+        const o = oRows[0];
+        db.query("UPDATE agent_subscription_orders SET status='paid' WHERE orderId=?", [razorpay_order_id], () => {
+            db.query("SELECT value FROM kv_admin_entities WHERE `key`='agents'", (aErr, aRows) => {
+                if (aErr) return res.status(500).json({ error: 'DB error: ' + aErr.message });
+                let agents = [];
+                try { agents = aRows && aRows.length ? JSON.parse(aRows[0].value) : []; } catch (e) {}
+                const idx = agents.findIndex(a => a && a.username && a.username.toLowerCase() === (o.username || '').toLowerCase());
+                if (idx === -1) return res.status(404).json({ error: 'Agent record nahi mila.' });
+                const agent = agents[idx];
+                const today = new Date(); today.setHours(0, 0, 0, 0);
+                const curExp = agent.subExpiry ? new Date(agent.subExpiry) : null;
+                const base = (curExp && curExp > today) ? curExp : today;
+                const newExp = new Date(base); newExp.setDate(newExp.getDate() + Number(o.days));
+                const newExpStr = newExp.toISOString().split('T')[0];
+                const newStartStr = today.toISOString().split('T')[0];
+                agents[idx] = Object.assign({}, agent, { planId: o.planId, subStart: newStartStr, subExpiry: newExpStr });
+                db.query("UPDATE kv_admin_entities SET value=? WHERE `key`='agents'", [JSON.stringify(agents)], (uErr) => {
+                    if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
+                    // ── Is agent ke sabhi students ka subscription bhi turant activate karo ──
+                    db.query("SELECT value FROM kv_admin_entities WHERE `key`='students'", (sErr, sRows) => {
+                        let students = [];
+                        try { students = sRows && sRows.length ? JSON.parse(sRows[0].value) : []; } catch (e) {}
+                        let activatedCount = 0;
+                        students = students.map(s => {
+                            if (s && s.agentId === agent.agentId) {
+                                activatedCount++;
+                                return Object.assign({}, s, { subscription_status: 'active', subscription_expiry: newExpStr });
+                            }
+                            return s;
+                        });
+                        const saveStudents = (cb) => {
+                            if (!activatedCount) return cb();
+                            db.query("UPDATE kv_admin_entities SET value=? WHERE `key`='students'", [JSON.stringify(students)], () => cb());
+                        };
+                        saveStudents(() => {
+                            // ── Payment history log karo (Admin Panel isi 'agent_payments' blob ko dekhta hai) ──
+                            db.query("SELECT value FROM kv_blob WHERE `key`='agent_payments'", (payErr, payRows) => {
+                                let payments = [];
+                                try { payments = payRows && payRows.length ? JSON.parse(payRows[0].value) : []; } catch (e) {}
+                                const paymentRecord = {
+                                    id: 'pay' + Date.now(), agentId: agent.id, agentDbId: agent.agentId, agentName: agent.name,
+                                    planId: o.planId, planName: o.planName, amount: o.amount, mode: 'Razorpay',
+                                    note: 'Ref: ' + razorpay_payment_id,
+                                    date: new Date().toLocaleString('hi-IN'), newExpiry: newExpStr
+                                };
+                                payments.push(paymentRecord);
+                                db.query(
+                                    "INSERT INTO kv_blob (`key`, value) VALUES ('agent_payments', ?) ON DUPLICATE KEY UPDATE value = ?",
+                                    [JSON.stringify(payments), JSON.stringify(payments)],
+                                    (finalErr) => {
+                                        if (finalErr) return res.status(500).json({ error: 'DB error: ' + finalErr.message });
+                                        res.json({
+                                            success: true, planId: o.planId, planName: o.planName,
+                                            subStart: newStartStr, subExpiry: newExpStr,
+                                            studentsActivated: activatedCount, paymentRecord: paymentRecord, agent: agents[idx]
+                                        });
+                                    }
+                                );
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    });
 });
 
 // ══════════════════════════════════════════════════════════════════
