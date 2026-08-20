@@ -99,6 +99,17 @@ const db = mysql.createPool({
     database: process.env.DB_NAME,               // DB Name — Render Environment se aayega
     waitForConnections: true,
     connectionLimit: 10,
+    // 🆕 FIX: "Upload fail: DB error: connect ETIMEDOUT" — yeh error tab
+    // aata tha jab Admin Panel se save/update karte waqt pool ka koi
+    // pehle se khula hua connection istemal hota tha jo, thodi der idle
+    // rehne ke baad, beech ke kisi network device (NAT/load-balancer) ne
+    // chupchaap band kar diya tha — agli query use karne ki koshish karti
+    // to turant timeout ho jaata. Neeche 3 cheezein fix karti hain:
+    connectTimeout: 30000,        // (1) naya connection banane ke liye zyada time (pehle default ~10s, dheeme/cold-start network par kaafi nahi tha)
+    enableKeepAlive: true,        // (2) TCP keep-alive packets bhejta rahega — beech ke devices idle connection ko silently band nahi karenge
+    keepAliveInitialDelay: 10000,
+    idleTimeout: 60000,           // (3) 60 second se zyada idle pade connections ko pool khud hi safaai kar deta hai, taaki koi "half-dead" connection kabhi handout na ho
+    maxIdle: 10,
     ssl: {
         rejectUnauthorized: false
     },
@@ -106,6 +117,40 @@ const db = mysql.createPool({
         mysql_clear_password: () => () => Buffer.from(process.env.DB_PASSWORD || '')
     }
 });
+
+// 🆕 Pool-level error handler — agar koi idle connection background mein
+// (kisi bhi query ke bina) khud hi drop ho jaaye, to Node.js ka default
+// behavior POORE SERVER ko crash kar dena hota (uncaught exception) — jo
+// pehle shayad kabhi-kabhar random, poore-app-wide outages ki wajah raha
+// ho. Ab aisi error sirf yahan log hoti hai; mysql2 pool khud us connection
+// ko replace kar deta hai, koi aur asar nahi padta.
+db.on('error', (err) => {
+    console.error('❌ MySQL pool-level error (auto-recovered, connection pool se hata di gayi):', err.code || err.message);
+});
+
+// 🆕 Transient network errors (jaise ETIMEDOUT, connection reset, etc.) par
+// ek query ko khud-ba-khud ek baar retry kar deta hai — user ko error dikhne
+// se pehle. `db.getConnection()` (startup table-setup ke liye) bilkul waisa
+// hi rehta hai, sirf `.query()` yahan wrap ho raha hai.
+const _rawDbQuery = db.query.bind(db);
+const TRANSIENT_DB_ERROR_CODES = ['ETIMEDOUT', 'ECONNRESET', 'PROTOCOL_CONNECTION_LOST', 'ECONNREFUSED', 'ENOTFOUND', 'EPIPE', 'PROTOCOL_SEQUENCE_TIMEOUT'];
+db.query = function (sql, params, callback) {
+    // db.query(sql, cb) aur db.query(sql, params, cb) — dono call-styles support karo
+    if (typeof params === 'function') { callback = params; params = undefined; }
+    function attempt(retriesLeft) {
+        function handleResult(err, results, fields) {
+            if (err && TRANSIENT_DB_ERROR_CODES.includes(err.code) && retriesLeft > 0) {
+                console.warn('⚠️ DB transient error (' + err.code + ') — 500ms baad retry ho raha hai (' + retriesLeft + ' attempt(s) bache hain)...');
+                setTimeout(() => attempt(retriesLeft - 1), 500);
+                return;
+            }
+            if (callback) callback(err, results, fields);
+        }
+        if (params !== undefined) _rawDbQuery(sql, params, handleResult);
+        else _rawDbQuery(sql, handleResult);
+    }
+    attempt(2); // pehli koshish + 2 retries = total 3 attempts
+};
 
 const JWT_SECRET = process.env.JWT_SECRET;
 
