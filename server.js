@@ -6,6 +6,32 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const multer = require('multer'); // 🆕 file upload (Hero image/Logo/APK) ke liye
 
+// ══════════════════════════════════════════════════════════════════
+// 🛡️ PROCESS-LEVEL SAFETY NET — sabse pehli cheez jo file mein chalti
+//   hai, taaki NEECHE ki poori startup code (DB pool banana, routes
+//   register karna, middleware, waghera) bhi is safety net ke andar
+//   aa jaaye.
+//   🔒 CRITICAL FIX: yeh handlers pehle file ke bilkul AAKHIR mein
+//   (app.listen se theek pehle) the. Iska matlab: agar startup ke
+//   dauraan — DB pool banate waqt, ya kisi route register karte
+//   waqt, ya kisi bhi synchronous code mein — koi error throw hoti,
+//   to Node.js process TURANT crash ho jaata, kyunki safety net
+//   abhi register hi nahi hua tha jab tak file poori load na ho
+//   jaaye. Yehi wajah thi ki DB unreachable hone par sirf DB calls
+//   fail nahi hote the — POORA SERVER hi crash ho jaata tha, aur
+//   browser mein "Failed to fetch" (server se koi response hi
+//   nahi) dikhta tha, na ki ek normal "DB error" JSON response.
+//   Ab yeh sabse pehle register hote hain — koi bhi startup ya
+//   runtime error ab poore server ko kabhi crash nahi karegi,
+//   sirf log hogi.
+// ══════════════════════════════════════════════════════════════════
+process.on('uncaughtException', (err) => {
+    console.error('🚨 UNCAUGHT EXCEPTION (server crash rukwaya gaya):', err && err.stack);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('🚨 UNHANDLED PROMISE REJECTION (server crash rukwaya gaya):', reason);
+});
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -2022,23 +2048,9 @@ app.use((err, req, res, next) => {
 });
 
 // ══════════════════════════════════════════════════════════════════
-// 🛡️ PROCESS-LEVEL SAFETY NET — agar kahin bhi (kisi bhi route ke
-//   db.query callback, bcrypt, jwt, waghera mein) koi unexpected error
-//   throw ho jaaye jo upar wale error-handler tak nahi pahunch paata
-//   (kyunki woh sirf route ke andar wale synchronous throws pakadta
-//   hai, deeply-nested async callbacks ke throws nahi), to NORMALLY
-//   Node.js poora process crash kar deta — matlab TURANT us waqt jo
-//   bhi user site use kar raha ho, sabke liye "Failed to fetch" (server
-//   se koi jawab hi nahi) aa jaata, jab tak Render dobara restart na kare.
-//   Ab aisi koi bhi crash sirf LOG hogi, server chalta rahega — sirf
-//   wahi ek request fail hogi, baaki poori site chalti rahegi.
-// ══════════════════════════════════════════════════════════════════
-process.on('uncaughtException', (err) => {
-    console.error('🚨 UNCAUGHT EXCEPTION (server crash rukwaya gaya):', err && err.stack);
-});
-process.on('unhandledRejection', (reason) => {
-    console.error('🚨 UNHANDLED PROMISE REJECTION (server crash rukwaya gaya):', reason);
-});
+// 🛡️ Process-level crash-protection (uncaughtException/unhandledRejection)
+// ab file ke bilkul shuru mein register hoti hai — dekhein sabse upar,
+// requires ke turant baad. Yahan dobara likhne ki zaroorat nahi.
 
 // Start Server
 app.listen(PORT, () => {
