@@ -94,6 +94,7 @@ function requireActiveMaterialUser(req, res, next) {
 -------------------------------------------------------------------------- */
 const db = mysql.createPool({
     host: process.env.DB_HOST,                 // Cloud SQL Public IP — Render Environment se aayega
+    port: process.env.DB_PORT ? parseInt(process.env.DB_PORT, 10) : 3306,  // 🆕 pehle hardcoded/missing tha — ab Render se override bhi ho sakta hai
     user: process.env.DB_USER,                  // DB User — Render Environment se aayega
     password: process.env.DB_PASSWORD,           // DB Password — Render Environment se aayega
     database: process.env.DB_NAME,               // DB Name — Render Environment se aayega
@@ -207,6 +208,51 @@ function insertWithIdHeal(sql, params, tableName, callback) {
         callback(err, result);
     });
 }
+
+// 🆕 DIAGNOSTIC LOG: exact config (password masked) jo istemal ho raha hai —
+// taaki agar connection fail ho to Render Logs mein turant dikh jaaye ki
+// KAUN SA host/port/database/user try ho raha hai. "Total outage" (yaani
+// HAR route fail ho raha ho) zyada tar in wajahon se hoti hai, jinhe
+// connectTimeout/retry jaisi client-side tuning theek nahi kar sakti:
+//   1. DB_HOST/DB_PORT galat hai Render Environment mein
+//   2. Cloud SQL/DB server ke "Authorized Networks"/Firewall mein Render
+//      ka outbound IP allow nahi hai
+//   3. Database instance khud band/paused pada hai
+//   4. DB_USER/DB_PASSWORD galat hai
+console.log('🔍 DB connect try ho raha hai → host=' + (process.env.DB_HOST || '❌ MISSING') +
+    ' port=' + (process.env.DB_PORT || '3306 (default)') +
+    ' database=' + (process.env.DB_NAME || '❌ MISSING') +
+    ' user=' + (process.env.DB_USER ? process.env.DB_USER[0] + '***' : '❌ MISSING') +
+    ' password=' + (process.env.DB_PASSWORD ? '***set*** (' + process.env.DB_PASSWORD.length + ' chars)' : '❌ MISSING'));
+
+// 🆕 Startup par bhi retry-with-backoff — agar DB thodi der ke liye
+// unreachable ho (jaise Render aur DB ek saath cold-start ho rahe hon),
+// to sirf ek baar try karke haar maan lene ki bajaye 5 baar, badhte hue
+// gap ke saath, try karta hai. Yeh sirf ek quick health-check hai —
+// asli table-setup (neeche) apne aap chalta hai jaise pehle chalta tha.
+function connectWithRetry(attemptsLeft, delayMs) {
+    db.getConnection((err, connection) => {
+        if (err) {
+            console.error('❌ DB connection attempt fail: ' + err.code + ' — ' + err.message);
+            if (attemptsLeft > 1) {
+                console.warn('⏳ ' + (delayMs / 1000) + ' second baad phir try karenge... (' + (attemptsLeft - 1) + ' attempt(s) bache hain)');
+                setTimeout(() => connectWithRetry(attemptsLeft - 1, Math.min(delayMs * 2, 30000)), delayMs);
+            } else {
+                console.error('❌❌❌ DB se bilkul connect nahi ho paaya. Yeh checklist verify karein:');
+                console.error('   1. Render → Environment tab → DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/DB_NAME sahi hain?');
+                console.error('   2. Aapke DB server (Cloud SQL/other) ki "Authorized Networks" ya Firewall mein Render ka outbound IP allow hai?');
+                console.error('      (Render ka IP dynamic ho sakta hai — testing ke liye 0.0.0.0/0 allow karke confirm karein ki yahi wajah thi)');
+                console.error('   3. Database instance chal raha hai (paused/stopped to nahi)?');
+                console.error('   4. Yeh MySQL database hai — agar aapne kahin MongoDB/Mongoose setup kiya hai wahan yeh config apply nahi hoga.');
+                console.error('   Server phir bhi chalta rahega aur naye connection attempts karta rahega jab bhi koi request aayegi.');
+            }
+            return;
+        }
+        console.log('✓ Quick health-check connection safal — DB reachable hai.');
+        connection.release();
+    });
+}
+connectWithRetry(5, 2000);
 
 db.getConnection((err, connection) => {
     if (err) {
