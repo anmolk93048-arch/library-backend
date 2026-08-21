@@ -1,10 +1,10 @@
 const express = require('express');
-const { Pool } = require('pg'); // 🆕 Supabase (PostgreSQL) ke liye pg package
+const mysql = require('mysql2');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
-const multer = require('multer');
+const multer = require('multer'); // 🆕 file upload (Hero image/Logo/APK) ke liye
 
 // ══════════════════════════════════════════════════════════════════
 // 🛡️ PROCESS-LEVEL SAFETY NET
@@ -52,106 +52,88 @@ function getAuthUser(req) {
     }
 }
 
+function requireActiveMaterialUser(req, res, next) {
+    const auth = getAuthUser(req);
+    if (!auth || auth.role !== 'material_user' || !auth.userId) {
+        return next();
+    }
+    db.query('SELECT status FROM material_users WHERE userId = ?', [auth.userId], (err, rows) => {
+        if (err) return next();
+        if (rows && rows[0] && rows[0].status === 'blocked') {
+            return res.status(403).json({ error: 'Yeh ID admin dwara block kar di gayi hai. Aap ab is portal ka istemal nahi kar sakte.' });
+        }
+        next();
+    });
+}
+
 /* --------------------------------------------------------------------------
-   Database Connection (Supabase / PostgreSQL Pool)
+   Database Connection
 -------------------------------------------------------------------------- */
-const db = new Pool({
-    connectionString: process.env.DATABASE_URL, // Supabase ka connection string Render env mein rahega
+const db = mysql.createPool({
+    host: process.env.DB_HOST,
+    port: process.env.DB_PORT ? parseInt(process.env.DB_PORT, 10) : 3306,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    waitForConnections: true,
+    connectionLimit: 10,
+    connectTimeout: 30000,
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 10000,
+    idleTimeout: 60000,
+    maxIdle: 10,
     ssl: {
         rejectUnauthorized: false
+    },
+    authPlugins: {
+        mysql_clear_password: () => () => Buffer.from(process.env.DB_PASSWORD || '')
     }
 });
-
-// PostgreSQL ke liye query helper taaki aapke purane mysql query format ('SELECT * FROM users WHERE id = ?', [id]) ko 
-// automatically PostgreSQL format ($1, $2...) mein convert kiya ja sake ya aap seedhe use kar sakein.
-// Lekin agar aapne query likhi hain, toh dhyan rakhein ki Postgres $1, $2 use karta hai.
-db.query = async function (text, params, callback) {
-    if (typeof params === 'function') {
-        callback = params;
-        params = undefined;
-    }
-    try {
-        // MySQL ke '?' placeholders ko PostgreSQL ke '$1, $2, $3...' mein automatically badalne ka jugaad
-        let paramIndex = 1;
-        const convertedText = text.replace(/\?/g, () => `$${paramIndex++}`);
-        
-        const start = Date.now();
-        const res = await Pool.prototype.query.call(db, convertedText, params);
-        const duration = Date.now() - start;
-        
-        if (callback) callback(null, res.rows, res);
-        return res;
-    } catch (err) {
-        console.error('❌ Database Query Error:', err.message, 'SQL:', text);
-        if (callback) callback(err, null, null);
-        throw err;
-    }
-};
 
 db.on('error', (err) => {
-    console.error('❌ Unexpected error on idle PostgreSQL client', err);
+    console.error('❌ MySQL pool-level error:', err.code || err.message);
 });
+
+const _rawDbQuery = db.query.bind(db);
+const TRANSIENT_DB_ERROR_CODES = ['ETIMEDOUT', 'ECONNRESET', 'PROTOCOL_CONNECTION_LOST', 'ECONNREFUSED', 'ENOTFOUND', 'EPIPE', 'PROTOCOL_SEQUENCE_TIMEOUT'];
+db.query = function (sql, params, callback) {
+    if (typeof params === 'function') { callback = params; params = undefined; }
+    function attempt(retriesLeft) {
+        function handleResult(err, results, fields) {
+            if (err && TRANSIENT_DB_ERROR_CODES.includes(err.code) && retriesLeft > 0) {
+                console.warn('⚠️ DB transient error — retry ho raha hai...');
+                setTimeout(() => attempt(retriesLeft - 1), 500);
+                return;
+            }
+            if (callback) callback(err, results, fields);
+        }
+        if (params !== undefined) _rawDbQuery(sql, params, handleResult);
+        else _rawDbQuery(sql, handleResult);
+    }
+    attempt(2);
+};
 
 const JWT_SECRET = process.env.JWT_SECRET;
 
-const REQUIRED_ENV = ['DATABASE_URL', 'JWT_SECRET'];
+const REQUIRED_ENV = ['DB_HOST', 'DB_USER', 'DB_PASSWORD', 'DB_NAME', 'JWT_SECRET'];
 const missingEnv = REQUIRED_ENV.filter(k => !process.env[k]);
 if (missingEnv.length) {
-    console.error('❌ Missing Environment Variables: ' + missingEnv.join(', '));
+    console.error('❌ Yeh zaroori Environment Variables set nahi hain: ' + missingEnv.join(', '));
 }
 
-console.log('🔍 Supabase Database connect try ho raha hai...');
-
-// Tables setup for Supabase (PostgreSQL syntax)
-db.connect((err, client, release) => {
+// ── TABLES INITIALIZATION ──────────────────────────────────────────
+db.getConnection((err, connection) => {
     if (err) {
-        console.error('❌ Supabase DB connection fail hua:', err.stack);
+        console.error('❌ Table setup fail hua: ' + err.message);
     } else {
-        console.log('✓ Supabase Database se successfully connection jud gaya hai!');
-        release();
-
-        // Tables creation
-        client.query(`
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                email VARCHAR(255) UNIQUE NOT NULL,
-                password VARCHAR(255) NOT NULL,
-                role VARCHAR(50) DEFAULT 'user',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        `).catch(e => console.error('Users table error:', e.message));
-
-        client.query(`
-            CREATE TABLE IF NOT EXISTS material_user_requests (
-                id SERIAL PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                village VARCHAR(255),
-                address VARCHAR(500),
-                email VARCHAR(255),
-                mobile VARCHAR(20) NOT NULL,
-                photo TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        `).catch(e => console.error('Material requests table error:', e.message));
-
-        client.query(`
-            CREATE TABLE IF NOT EXISTS material_users (
-                id SERIAL PRIMARY KEY,
-                userId VARCHAR(50) UNIQUE NOT NULL,
-                name VARCHAR(255) NOT NULL,
-                village VARCHAR(255),
-                address VARCHAR(500),
-                email VARCHAR(255),
-                mobile VARCHAR(20) UNIQUE NOT NULL,
-                photo TEXT,
-                password_hash VARCHAR(255),
-                status VARCHAR(20) DEFAULT 'active',
-                blockedReason VARCHAR(500),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        `).catch(e => console.error('Material users table error:', e.message));
+        console.log('✓ Database se successfully connection jud gaya hai!');
+        connection.release();
     }
 });
 
-// (बाकी का आपका सारा कोड यहाँ सुरक्षित रहेगा)
+// ══════════════════════════════════════════════════════════════════
+// 🚀 SERVER STARTUP — Yeh sabse zaroori hai taaki server band na ho
+// ══════════════════════════════════════════════════════════════════
+app.listen(PORT, () => {
+    console.log(`🚀 Server is successfully running on port ${PORT}`);
+});
