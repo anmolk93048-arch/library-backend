@@ -1072,7 +1072,15 @@ app.get('/api/site-content/file/:id', (req, res) => {
 //   deploy karne ki zaroorat NAHI.
 // ══════════════════════════════════════════════════════════════════
 app.get('/api/pages/:slug', (req, res) => {
-    db.query('SELECT name, mime, data FROM site_files WHERE slug=?', [req.params.slug], (err, rows) => {
+    // 🔒 FIX: MySQL mein VARCHAR comparison zyada tar case-insensitive hoti
+    // hai (default collation), lekin Postgres mein '=' hamesha case-sensitive
+    // hai. slugify() upload ke waqt hamesha lowercase karta hai, lekin yahan
+    // URL se aaya slug seedha (bina lowercase kiye) compare ho raha tha —
+    // isliye MySQL→Postgres migration ke baad koi bhi thoda different-case
+    // URL (jaise /Admin-Login) match nahi karta tha, chahe file upload ho
+    // chuki ho. Ab LOWER() dono taraf lagाya hai, taaki casing kabhi matter
+    // na kare.
+    db.query('SELECT name, mime, data FROM site_files WHERE LOWER(slug)=LOWER(?)', [req.params.slug], (err, rows) => {
         if (err) return res.status(500).send('DB error: ' + err.message);
         if (!rows || !rows.length) return res.status(404).send('Yeh page abhi upload nahi hua hai: /' + req.params.slug);
         const f = rows[0];
