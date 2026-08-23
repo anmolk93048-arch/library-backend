@@ -896,7 +896,7 @@ app.post('/api/auth/login', (req, res) => {
 const ENTITY_KEYS = ['admins', 'staff', 'agents', 'students', 'agent_logins'];
 const BLOB_KEYS = ['settings', 'activity', 'notices', 'mem_plans', 'members',
     'hrms_registrations', 'staff_att', 'leave_requests', 'agent_plans', 'agent_payments',
-    'razorpay_config', 'sms_api_config'];
+    'razorpay_config', 'sms_api_config', 'agent_pending_registrations'];
 
 function kvGet(table, key, res, wrapValue) {
     db.query(`SELECT value FROM ${table} WHERE \`key\` = ?`, [key], (err, rows) => {
@@ -1101,6 +1101,73 @@ app.get('/api/pages', (req, res) => {
 
 // Convenience direct aliases (frontend polls these paths directly)
 app.get('/api/students', (req, res) => kvGet('kv_admin_entities', 'students', res));
+
+// 🔒 FIX: pehle frontend khud hi agla SHL-XXX ID "guess" karta tha —
+// sirf screen par abhi dikh rahe rows aur ek purani localStorage copy
+// dekhkar. Agar table filtered ho, ya kisi doosre device/agent ne
+// beech mein koi student add kiya ho jo abhi is browser mein sync
+// nahi hua, to yeh guess galat ho jaata — duplicate ya gaya-guzra ID
+// ban jaata. Ab yeh ID seedha live database (jo hamesha sabse sahi/
+// up-to-date jagah hai) dekh kar diya jaata hai.
+// 🆕 PENDING REGISTRATION SYNC — pehle "Agent Register" form seedha
+// Firebase (shdl/agent_logins) mein likh kar turant agent ko active kar
+// deta tha — Admin Panel ko iske baare mein pata hi nahi chalta tha,
+// koi "Pending" list thi hi nahi jahan yeh dikhta. Ab yeh backend mein
+// pending register hota hai; Admin Panel isse dekh kar Approve/Reject
+// karta hai — approve hone tak agent login nahi kar sakta.
+app.post('/api/agent-registrations', (req, res) => {
+    const { name, username, password, mobile, company } = req.body || {};
+    if (!name || !username || !password) return res.status(400).json({ error: 'Naam, username aur password zaroori hain.' });
+    if (password.length < 4) return res.status(400).json({ error: 'Password kam se kam 4 characters ka hona chahiye.' });
+    const uname = String(username).trim().toLowerCase();
+    if (uname.indexOf(' ') !== -1) return res.status(400).json({ error: 'Username mein space nahi hona chahiye.' });
+
+    db.query("SELECT value FROM kv_admin_entities WHERE \"key\"='agents'", (aErr, aRows) => {
+        if (aErr) return res.status(500).json({ error: 'DB error: ' + aErr.message });
+        let agents = [];
+        try { agents = aRows && aRows.length ? JSON.parse(aRows[0].value) : []; } catch (e) {}
+        if (agents.some(a => a && a.username && a.username.toLowerCase() === uname)) {
+            return res.status(409).json({ error: 'Yeh username pehle se ek active agent ke paas hai.' });
+        }
+        db.query("SELECT value FROM kv_blob WHERE \"key\"='agent_pending_registrations'", (pErr, pRows) => {
+            if (pErr) return res.status(500).json({ error: 'DB error: ' + pErr.message });
+            let pending = [];
+            try { pending = pRows && pRows.length ? JSON.parse(pRows[0].value) : []; } catch (e) {}
+            if (pending.some(p => p && p.username && p.username.toLowerCase() === uname && p.status === 'pending')) {
+                return res.status(409).json({ error: 'Is username se ek registration pehle se hi Admin approval ka wait kar raha hai.' });
+            }
+            const rec = {
+                id: 'REG' + Date.now(), name, username: uname, password, mobile: mobile || '', company: company || '',
+                status: 'pending', submittedOn: new Date().toISOString()
+            };
+            pending.push(rec);
+            db.query(
+                "INSERT INTO kv_blob (\"key\", value) VALUES ('agent_pending_registrations', ?) ON CONFLICT (\"key\") DO UPDATE SET value = EXCLUDED.value",
+                [JSON.stringify(pending)],
+                (insErr) => {
+                    if (insErr) return res.status(500).json({ error: 'DB error: ' + insErr.message });
+                    res.status(201).json({ success: true, id: rec.id });
+                }
+            );
+        });
+    });
+});
+
+
+app.get('/api/students/next-id', (req, res) => {
+    db.query("SELECT value FROM kv_admin_entities WHERE \"key\"='students'", (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        let students = [];
+        try { students = rows && rows.length ? JSON.parse(rows[0].value) : []; } catch (e) {}
+        let maxNum = 0;
+        (students || []).forEach(s => {
+            const sid = (s && (s.studentId || s.id)) || '';
+            const m = /SHL-(\d+)/i.exec(sid);
+            if (m) { const n = parseInt(m[1], 10); if (n > maxNum) maxNum = n; }
+        });
+        res.json({ nextId: 'SHL-' + String(maxNum + 1).padStart(3, '0') });
+    });
+});
 app.get('/api/settings', (req, res) => kvGet('kv_blob', 'settings', res));
 
 // ══════════════════════════════════════════════════════════════════
@@ -1342,9 +1409,19 @@ app.post('/api/payments/student-subscription/verify', (req, res) => {
                 }
                 const saveStudents = (cb) => {
                     if (idx === -1) return cb(); // student record admin-entities mein na mile to bhi payment record safe rahega
-                    db.query("UPDATE kv_admin_entities SET value=? WHERE `key`='students'", [JSON.stringify(students)], () => cb());
+                    db.query("UPDATE kv_admin_entities SET value=? WHERE `key`='students'", [JSON.stringify(students)], (uErr) => cb(uErr));
                 };
-                saveStudents(() => {
+                saveStudents((studentsSaveErr) => {
+                    if (studentsSaveErr) {
+                        // 🔒 CRITICAL FIX: pehle yahan error discard ho jaati thi — student ka
+                        // payment safal ho jaata, par subscription_status DB mein kabhi
+                        // 'active' save hi nahi hota tha, phir bhi response {success:true}
+                        // bhej deta tha. Ab is galti ko chhupaya nahi jaata — turant, saaf
+                        // error return hoti hai taaki payment safal hone ke bawajood
+                        // "subscription active nahi ho rahi" jaisi silent-fail kabhi na ho.
+                        console.error('❌ CRITICAL: Payment ho gaya (Ref: ' + razorpay_payment_id + ') par student subscription_status save nahi ho paya:', studentsSaveErr.message);
+                        return res.status(500).json({ error: 'Payment safal hua, par subscription activate karte waqt DB error aayi: ' + studentsSaveErr.message + '. Support se contact karein, payment record surakshit hai (Ref: ' + razorpay_payment_id + ').' });
+                    }
                     // ── fee_payments mein log karo — Admin Fee History mein turant dikhega ──
                     insertWithIdHeal(
                         'INSERT INTO fee_payments (studentId, amount, mode, note, status) VALUES (?,?,?,?,?)',
@@ -1441,6 +1518,10 @@ app.post('/api/payments/agent-subscription/verify', (req, res) => {
                     if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
                     // ── Is agent ke sabhi students ka subscription bhi turant activate karo ──
                     db.query("SELECT value FROM kv_admin_entities WHERE `key`='students'", (sErr, sRows) => {
+                        if (sErr) {
+                            console.error('❌ Agent subscription renew ho gaya, par students list padhne mein DB error:', sErr.message);
+                            return res.status(500).json({ error: 'Agent subscription renew ho gayi, par students activate karte waqt DB error aayi: ' + sErr.message + '. Agent ki subscription safe hai, dobara try karein.' });
+                        }
                         let students = [];
                         try { students = sRows && sRows.length ? JSON.parse(sRows[0].value) : []; } catch (e) {}
                         let activatedCount = 0;
@@ -1453,11 +1534,25 @@ app.post('/api/payments/agent-subscription/verify', (req, res) => {
                         });
                         const saveStudents = (cb) => {
                             if (!activatedCount) return cb();
-                            db.query("UPDATE kv_admin_entities SET value=? WHERE `key`='students'", [JSON.stringify(students)], () => cb());
+                            db.query("UPDATE kv_admin_entities SET value=? WHERE `key`='students'", [JSON.stringify(students)], (uErr2) => cb(uErr2));
                         };
-                        saveStudents(() => {
+                        saveStudents((studentsSaveErr) => {
+                            // 🔒 CRITICAL FIX: yeh error pehle discard ho jaati thi — agent ki
+                            // apni subscription to save ho jaati thi, par uske students ka
+                            // subscription silently activate nahi hota tha, phir bhi response
+                            // 'studentsActivated' mein galat count bhej deta tha.
+                            if (studentsSaveErr) {
+                                console.error('❌ Agent subscription renew ho gaya, par students activate karne mein DB error:', studentsSaveErr.message);
+                                return res.status(500).json({ error: 'Agent subscription renew ho gayi, par students activate karte waqt DB error aayi: ' + studentsSaveErr.message + '. Agent ki subscription safe hai, dobara try karein.' });
+                            }
                             // ── Payment history log karo (Admin Panel isi 'agent_payments' blob ko dekhta hai) ──
                             db.query("SELECT value FROM kv_blob WHERE `key`='agent_payments'", (payErr, payRows) => {
+                                if (payErr) {
+                                    console.error('❌ Agent subscription + students activate ho gaye, par payment history save nahi ho payi:', payErr.message);
+                                    // Yeh sirf history/record-keeping hai — subscription khud pehle
+                                    // hi safal ho chuki hai, isliye request fail nahi karte, par
+                                    // clearly Render logs mein flag zaroor karte hain.
+                                }
                                 let payments = [];
                                 try { payments = payRows && payRows.length ? JSON.parse(payRows[0].value) : []; } catch (e) {}
                                 const paymentRecord = {
@@ -1471,7 +1566,7 @@ app.post('/api/payments/agent-subscription/verify', (req, res) => {
                                     "INSERT INTO kv_blob (\"key\", value) VALUES ('agent_payments', ?) ON CONFLICT (\"key\") DO UPDATE SET value = EXCLUDED.value",
                                     [JSON.stringify(payments)],
                                     (finalErr) => {
-                                        if (finalErr) return res.status(500).json({ error: 'DB error: ' + finalErr.message });
+                                        if (finalErr) console.error('❌ agent_payments log save nahi hui:', finalErr.message);
                                         res.json({
                                             success: true, planId: o.planId, planName: o.planName,
                                             subStart: newStartStr, subExpiry: newExpStr,
@@ -1484,6 +1579,96 @@ app.post('/api/payments/agent-subscription/verify', (req, res) => {
                     });
                 });
             });
+        });
+    });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 🔒 SUBSCRIPTION & ACCESS CONTROL SYSTEM
+//   Ek hi jagah se poore system (Agent/HRMS/Student teeno portals) ke
+//   liye subscription status calculate hota hai, taaki teeno jagah
+//   EXACT same rules follow hon:
+//     > 5 din baaki         → 'active'  (kuch nahi dikhta)
+//     0 se 5 din baaki      → 'warning' (banner dikhta hai, kaam chalu rehta hai)
+//     expiry ke baad, <=5 din → 'grace' (still kaam chalta hai, urgent warning)
+//     expiry ke 5 din baad  → 'locked' (portal disable, dynamic message)
+//   🛡️ FAIL-OPEN BY DESIGN: agar agent record hi na mile, ya usme
+//   subExpiry set hi na ho (jaise purane/legacy agents jinke liye yeh
+//   feature kabhi setup nahi hua), to kabhi lock NAHI karte — 'active'
+//   maan lete hain. Isse koi bhi agent achanak, bina wajah, lock nahi ho
+//   jaata jab yeh feature pehli baar deploy ho.
+// ══════════════════════════════════════════════════════════════════
+function computeAgentSubStatus(agent) {
+    if (!agent || !agent.subExpiry) return { status: 'active', daysLeft: null };
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const exp = new Date(agent.subExpiry);
+    if (isNaN(exp.getTime())) return { status: 'active', daysLeft: null };
+    const daysLeft = Math.ceil((exp - today) / 86400000);
+    if (daysLeft > 5) return { status: 'active', daysLeft };
+    if (daysLeft >= 0) return { status: 'warning', daysLeft };
+    if (daysLeft >= -5) return { status: 'grace', daysLeft };
+    return { status: 'locked', daysLeft };
+}
+
+function findAgentByIdOrUsername(idOrUsername, cb) {
+    db.query("SELECT value FROM kv_admin_entities WHERE \"key\"='agents'", (err, rows) => {
+        if (err) return cb(err);
+        let agents = [];
+        try { agents = rows && rows[0] ? JSON.parse(rows[0].value) : []; } catch (e) {}
+        const needle = String(idOrUsername || '').toLowerCase();
+        const agent = agents.find(a => a && (
+            (a.agentId && String(a.agentId).toLowerCase() === needle) ||
+            (a.username && String(a.username).toLowerCase() === needle)
+        ));
+        cb(null, agent || null, agents);
+    });
+}
+
+// GET /api/subscription-status/AGT001  ya  /api/subscription-status/agentusername
+// Agent App, HRMS Portal, aur Student Portal — teeno isi ek route se apna
+// (ya apne linked agent ka) status check karte hain, taaki rules kabhi
+// alag-alag jagah mismatch na hon.
+app.get('/api/subscription-status/:identifier', (req, res) => {
+    findAgentByIdOrUsername(req.params.identifier, (err, agent) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!agent) return res.json({ status: 'active', daysLeft: null, company: '', mobile: '', name: '' }); // fail-open
+        const info = computeAgentSubStatus(agent);
+        res.json({
+            status: info.status,
+            daysLeft: info.daysLeft,
+            company: agent.company || agent.name || '',
+            mobile: agent.mobile || '',
+            name: agent.name || ''
+        });
+    });
+});
+
+// 🆕 GRACE PERIOD (Admin Override) — Admin Panel ka "Extend Validity"
+// button isi route ko call karta hai. Payment ke bina bhi subExpiry ko
+// aage badha deta hai (5-10 din request par) — kisi bhi data ko chhuta
+// nahi, sirf yeh ek date field update hoti hai.
+app.post('/api/admin/extend-agent-validity', (req, res) => {
+    const { agentId, days } = req.body || {};
+    if (!agentId) return res.status(400).json({ error: 'agentId zaroori hai.' });
+    const extendDays = Math.min(Math.max(parseInt(days, 10) || 7, 1), 30); // 1-30 din ke beech, safety cap
+    findAgentByIdOrUsername(agentId, (err, agent, agents) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!agent) return res.status(404).json({ error: 'Agent nahi mila.' });
+        const idx = agents.findIndex(a => a === agent);
+        const today = new Date(); today.setHours(0, 0, 0, 0);
+        const curExp = agent.subExpiry ? new Date(agent.subExpiry) : null;
+        const base = (curExp && !isNaN(curExp.getTime()) && curExp > today) ? curExp : today;
+        const newExp = new Date(base); newExp.setDate(newExp.getDate() + extendDays);
+        const newExpStr = newExp.toISOString().split('T')[0];
+        agents[idx] = Object.assign({}, agent, {
+            subExpiry: newExpStr,
+            lastExtendedBy: 'admin',
+            lastExtendedOn: today.toISOString().split('T')[0],
+            lastExtendedDays: extendDays
+        });
+        db.query("UPDATE kv_admin_entities SET value=? WHERE \"key\"='agents'", [JSON.stringify(agents)], (uErr) => {
+            if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
+            res.json({ success: true, subExpiry: newExpStr, extendedDays: extendDays });
         });
     });
 });
@@ -1610,6 +1795,10 @@ app.post('/api/payment/update', (req, res) => {
 
             // ── Is agent ke saare students ka subscription bhi turant activate karo ──
             db.query("SELECT value FROM kv_admin_entities WHERE `key`='students'", (sErr, sRows) => {
+                if (sErr) {
+                    console.error('❌ Agent subscription renew ho gaya, par students list padhne mein DB error:', sErr.message);
+                    return res.status(500).json({ error: 'Agent subscription renew ho gayi, par students activate karte waqt DB error aayi: ' + sErr.message + '. Agent ki subscription safe hai, dobara try karein.' });
+                }
                 let students = [];
                 try { students = sRows && sRows.length ? JSON.parse(sRows[0].value) : []; } catch (e) {}
                 let activatedCount = 0;
@@ -1624,12 +1813,21 @@ app.post('/api/payment/update', (req, res) => {
                 }
                 const saveStudents = (cb) => {
                     if (!activatedCount) return cb();
-                    db.query("UPDATE kv_admin_entities SET value=? WHERE `key`='students'", [JSON.stringify(students)], () => cb());
+                    db.query("UPDATE kv_admin_entities SET value=? WHERE `key`='students'", [JSON.stringify(students)], (uErr2) => cb(uErr2));
                 };
 
-                saveStudents(() => {
+                // 🔒 CRITICAL FIX: yeh error pehle discard ho jaati thi — agent ki apni
+                // subscription to save ho jaati thi, par uske students ka subscription
+                // silently activate nahi hota tha, phir bhi response mein galat
+                // 'studentsActivated' count bhej diya jaata tha.
+                saveStudents((studentsSaveErr) => {
+                    if (studentsSaveErr) {
+                        console.error('❌ Agent subscription renew ho gaya, par students activate karne mein DB error:', studentsSaveErr.message);
+                        return res.status(500).json({ error: 'Agent subscription renew ho gayi, par students activate karte waqt DB error aayi: ' + studentsSaveErr.message + '. Agent ki subscription safe hai, dobara try karein.' });
+                    }
                     // ── Payment history log karo ──
                     db.query("SELECT value FROM kv_blob WHERE `key`='agent_payments'", (pErr, pRows) => {
+                        if (pErr) console.error('❌ Agent subscription + students activate ho gaye, par payment history save nahi ho payi:', pErr.message);
                         let payments = [];
                         try { payments = pRows && pRows.length ? JSON.parse(pRows[0].value) : []; } catch (e) {}
                         const paymentRecord = {
@@ -1643,7 +1841,7 @@ app.post('/api/payment/update', (req, res) => {
                             "INSERT INTO kv_blob (\"key\", value) VALUES ('agent_payments', ?) ON CONFLICT (\"key\") DO UPDATE SET value = EXCLUDED.value",
                             [paymentsJson],
                             (finalErr) => {
-                                if (finalErr) return res.status(500).json({ error: 'DB error: ' + finalErr.message });
+                                if (finalErr) console.error('❌ agent_payments log save nahi hui:', finalErr.message);
                                 res.json({ subStart: newStartStr, subExpiry: newExpStr, agent: agents[idx], paymentRecord, studentsActivated: activatedCount });
                             }
                         );
