@@ -543,6 +543,30 @@ db.getConnection((err, connection) => {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
+        `],
+        // 🆕 GLOBAL NOTIFICATION SYSTEM — Admin→Agent, Admin→SabAgents,
+        // Agent→Student, Agent→SabStudents, Agent→Employee, Agent→SabEmployees.
+        // target_scope: 'agent' | 'all_agents' | 'student' | 'all_students' |
+        //               'employee' | 'all_employees'
+        // target_id: specific agentId/studentId/empId (all_* ke liye NULL)
+        // scope_agent_id: 'all_students'/'all_employees' ke liye — kis agent
+        //                 ke sabhi students/employees ko yeh jaayega
+        // read_by: JSON array — jinhone padh liya unki id (agentId/studentId/
+        //          empId/'admin') yahan add ho jaati hai
+        ['notifications', `
+            CREATE TABLE IF NOT EXISTS notifications (
+                id SERIAL PRIMARY KEY,
+                from_role VARCHAR(30) NOT NULL,
+                from_name VARCHAR(255),
+                target_scope VARCHAR(30) NOT NULL,
+                target_id VARCHAR(100),
+                scope_agent_id VARCHAR(100),
+                title VARCHAR(255) NOT NULL,
+                message TEXT,
+                urgency VARCHAR(20) DEFAULT 'info',
+                read_by TEXT DEFAULT '[]',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
         `]
     ];
 
@@ -1628,6 +1652,87 @@ function findAgentByIdOrUsername(idOrUsername, cb) {
 // Agent App, HRMS Portal, aur Student Portal — teeno isi ek route se apna
 // (ya apne linked agent ka) status check karte hain, taaki rules kabhi
 // alag-alag jagah mismatch na hon.
+// ══════════════════════════════════════════════════════════════════
+// 🔔 GLOBAL NOTIFICATION SYSTEM — Admin → Agent → HRMS/Student
+//   Backend mein persist hoti hain, isliye refresh/naya login par bhi
+//   dikhti hain (pehle jo bell icons the woh sirf usi browser tak
+//   simit the — koi doosre device/session ko kabhi nahi dikhta tha).
+// ══════════════════════════════════════════════════════════════════
+
+// Bhejna — Admin (agentId ya 'all_agents') / Agent (studentId ya
+// 'all_students' apne under ke, empId ya 'all_employees' apne under ke)
+app.post('/api/notifications', (req, res) => {
+    const { fromRole, fromName, targetScope, targetId, scopeAgentId, title, message, urgency } = req.body || {};
+    const validScopes = ['agent', 'all_agents', 'student', 'all_students', 'employee', 'all_employees'];
+    if (!title) return res.status(400).json({ error: 'Title zaroori hai.' });
+    if (!validScopes.includes(targetScope)) return res.status(400).json({ error: 'Invalid targetScope.' });
+    db.query(
+        'INSERT INTO notifications (from_role, from_name, target_scope, target_id, scope_agent_id, title, message, urgency) VALUES (?,?,?,?,?,?,?,?)',
+        [fromRole || '', fromName || '', targetScope, targetId || null, scopeAgentId || null, title, message || '', urgency || 'info'],
+        (err, result) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            res.status(201).json({ success: true, id: result.insertId });
+        }
+    );
+});
+
+// Padhna — viewer apni identity/scope batata hai, backend match karke
+// relevant notifications deta hai (naye pehle).
+//   Agent dekhega:    ?role=agent&id=AGT001
+//   Student dekhega:  ?role=student&id=SHL-001&agentId=AGT001
+//   Employee dekhega: ?role=employee&id=EMP001&agentId=AGT001
+//   Admin dekhega:    ?role=admin  (koi bhejta nahi Admin ko, sirf apni bheji hui dekh sakta hai — abhi ke liye khaali)
+app.get('/api/notifications', (req, res) => {
+    const { role, id, agentId } = req.query || {};
+    let where = '1=0';
+    const params = [];
+    if (role === 'agent' && id) {
+        where = "(target_scope='agent' AND target_id=?) OR target_scope='all_agents'";
+        params.push(id);
+    } else if (role === 'student' && id) {
+        where = "(target_scope='student' AND target_id=?) OR (target_scope='all_students' AND scope_agent_id=?)";
+        params.push(id, agentId || '');
+    } else if (role === 'employee' && id) {
+        where = "(target_scope='employee' AND target_id=?) OR (target_scope='all_employees' AND scope_agent_id=?)";
+        params.push(id, agentId || '');
+    } else {
+        return res.json([]);
+    }
+    db.query(`SELECT * FROM notifications WHERE ${where} ORDER BY created_at DESC LIMIT 50`, params, (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        const myId = id || '';
+        const result = (rows || []).map(r => {
+            let readBy = [];
+            try { readBy = JSON.parse(r.read_by || '[]'); } catch (e) {}
+            return {
+                id: r.id, fromRole: r.from_role, fromName: r.from_name,
+                title: r.title, message: r.message, urgency: r.urgency,
+                createdAt: r.created_at, isRead: readBy.includes(myId)
+            };
+        });
+        res.json(result);
+    });
+});
+
+// Padh liya mark karna — viewer apni id bhejta hai, backend read_by
+// array mein add kar deta hai (agar pehle se nahi hai).
+app.post('/api/notifications/:id/read', (req, res) => {
+    const { viewerId } = req.body || {};
+    if (!viewerId) return res.status(400).json({ error: 'viewerId zaroori hai.' });
+    db.query('SELECT read_by FROM notifications WHERE id=?', [req.params.id], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!rows || !rows.length) return res.status(404).json({ error: 'Notification nahi mili.' });
+        let readBy = [];
+        try { readBy = JSON.parse(rows[0].read_by || '[]'); } catch (e) {}
+        if (!readBy.includes(viewerId)) readBy.push(viewerId);
+        db.query('UPDATE notifications SET read_by=? WHERE id=?', [JSON.stringify(readBy), req.params.id], (uErr) => {
+            if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
+            res.json({ success: true });
+        });
+    });
+});
+
+
 app.get('/api/subscription-status/:identifier', (req, res) => {
     findAgentByIdOrUsername(req.params.identifier, (err, agent) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
