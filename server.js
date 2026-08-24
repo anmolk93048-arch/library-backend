@@ -524,6 +524,27 @@ db.getConnection((err, connection) => {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         `],
+        // 🆕 Customer Registration Razorpay orders — jab order create hota
+        // hai tabhi customer ka naam/mobile/plan/amount yahan save ho jaate
+        // hain, taaki verify step client se dobara yeh values na maange
+        // (jo tamper ho sakti thin) balki seedha yahi se padhe.
+        ['customer_registration_orders', `
+            CREATE TABLE IF NOT EXISTS customer_registration_orders (
+                orderId VARCHAR(100) PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                mobile VARCHAR(20) NOT NULL,
+                email VARCHAR(255),
+                address VARCHAR(500),
+                note VARCHAR(500),
+                agentId VARCHAR(100) NOT NULL,
+                planId VARCHAR(150),
+                planName VARCHAR(150),
+                amount DECIMAL(10,2) NOT NULL,
+                status VARCHAR(20) DEFAULT 'created',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `],
+
         // 🆕 Uploaded files (Hero image / Logo / APK / login-page HTML) — DB mein
         // hi blob ki tarah store hote hain, kyunki Render ka disk restart/redeploy
         // pe reset ho jaata hai. 'slug': login-pages jaisi cheezon ko ek FIXED,
@@ -920,7 +941,7 @@ app.post('/api/auth/login', (req, res) => {
 const ENTITY_KEYS = ['admins', 'staff', 'agents', 'students', 'agent_logins'];
 const BLOB_KEYS = ['settings', 'activity', 'notices', 'mem_plans', 'members',
     'hrms_registrations', 'staff_att', 'leave_requests', 'agent_plans', 'agent_payments',
-    'razorpay_config', 'sms_api_config', 'agent_pending_registrations'];
+    'razorpay_config', 'sms_api_config', 'agent_pending_registrations', 'customer_pending_registrations'];
 
 function kvGet(table, key, res, wrapValue) {
     db.query(`SELECT value FROM ${table} WHERE \`key\` = ?`, [key], (err, rows) => {
@@ -1173,6 +1194,91 @@ app.post('/api/agent-registrations', (req, res) => {
                     res.status(201).json({ success: true, id: rec.id });
                 }
             );
+        });
+    });
+});
+
+
+// ══════════════════════════════════════════════════════════════════
+// 📋 CUSTOMER REGISTRATION — payment-gated. Customer plan chunta hai,
+//   Razorpay checkout khulta hai, aur SIRF payment successful hone ke
+//   baad hi registration DB mein save hoke Admin ke pending-approval
+//   queue mein jaata hai. Plan ki price hamesha server par (Admin ke
+//   asli mem_plans se) check hoti hai — client jo bheje uska koi
+//   matlab nahi, tamper-proof hai.
+// ══════════════════════════════════════════════════════════════════
+app.post('/api/customer-registrations/order', async (req, res) => {
+    if (!process.env.PAYMENT_API_KEY || !process.env.PAYMENT_API_SECRET) {
+        return res.status(501).json({ error: 'Payment keys Render Environment mein set nahi hain (PAYMENT_API_KEY / PAYMENT_API_SECRET).' });
+    }
+    const { name, mobile, email, address, note, agentId, planId } = req.body || {};
+    if (!name || !mobile) return res.status(400).json({ error: 'Naam aur mobile zaroori hain.' });
+    if (!/^\d{10}$/.test(String(mobile))) return res.status(400).json({ error: 'Sahi 10-digit mobile number likhein.' });
+    if (!agentId) return res.status(400).json({ error: 'agentId zaroori hai.' });
+    if (!planId) return res.status(400).json({ error: 'Membership plan chunna zaroori hai.' });
+
+    db.query("SELECT value FROM kv_blob WHERE \"key\"='mem_plans'", (pErr, pRows) => {
+        if (pErr) return res.status(500).json({ error: 'DB error: ' + pErr.message });
+        let plans = [];
+        try { plans = pRows && pRows.length ? JSON.parse(pRows[0].value) : []; } catch (e) {}
+        const plan = plans.find(p => p && p.id === planId);
+        if (!plan) return res.status(404).json({ error: 'Yeh membership plan Admin ke paas set nahi hai.' });
+        razorpayRequest('/v1/orders', {
+            amount: Math.round(Number(plan.price) * 100),
+            currency: 'INR',
+            receipt: 'custreg_' + mobile + '_' + Date.now()
+        }).then((order) => {
+            db.query(
+                'INSERT INTO customer_registration_orders (orderId, name, mobile, email, address, note, agentId, planId, planName, amount) VALUES (?,?,?,?,?,?,?,?,?,?)',
+                [order.id, name, mobile, email || '', address || '', note || '', agentId, plan.id, plan.name || '', plan.price],
+                (err) => {
+                    if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+                    res.json({ orderId: order.id, amount: order.amount, currency: order.currency, key: process.env.PAYMENT_API_KEY, plan: plan });
+                }
+            );
+        }).catch((e) => res.status(502).json({ error: 'Razorpay order banane mein error: ' + e.message }));
+    });
+});
+
+app.post('/api/customer-registrations/verify', (req, res) => {
+    const secret = process.env.PAYMENT_API_SECRET;
+    if (!secret) return res.status(501).json({ error: 'PAYMENT_API_SECRET Render Environment mein set nahi hai.' });
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+        return res.status(400).json({ error: 'Order ID, Payment ID aur Signature teeno zaroori hain.' });
+    }
+    const expected = crypto.createHmac('sha256', secret)
+        .update(razorpay_order_id + '|' + razorpay_payment_id)
+        .digest('hex');
+    if (expected !== razorpay_signature) {
+        return res.status(400).json({ error: 'Payment verify nahi hua — signature match nahi hui.' });
+    }
+    db.query("SELECT * FROM customer_registration_orders WHERE orderId=? AND status='created'", [razorpay_order_id], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!rows || !rows.length) return res.status(404).json({ error: 'Yeh order pehle se process ho chuka hai ya mila nahi.' });
+        const o = rows[0];
+        db.query("UPDATE customer_registration_orders SET status='paid' WHERE orderId=?", [razorpay_order_id], () => {
+            db.query("SELECT value FROM kv_blob WHERE \"key\"='customer_pending_registrations'", (cErr, cRows) => {
+                if (cErr) return res.status(500).json({ error: 'DB error: ' + cErr.message });
+                let pending = [];
+                try { pending = cRows && cRows.length ? JSON.parse(cRows[0].value) : []; } catch (e) {}
+                const rec = {
+                    id: 'CREG' + Date.now(), name: o.name, mobile: o.mobile, email: o.email || '',
+                    address: o.address || '', note: o.note || '', agentId: o.agentId,
+                    planId: o.planId, planName: o.planName, amount: o.amount,
+                    paymentRef: razorpay_payment_id, status: 'pending',
+                    submittedOn: new Date().toISOString()
+                };
+                pending.push(rec);
+                db.query(
+                    "INSERT INTO kv_blob (\"key\", value) VALUES ('customer_pending_registrations', ?) ON CONFLICT (\"key\") DO UPDATE SET value = EXCLUDED.value",
+                    [JSON.stringify(pending)],
+                    (insErr) => {
+                        if (insErr) return res.status(500).json({ error: 'DB error: ' + insErr.message });
+                        res.status(201).json({ success: true, id: rec.id });
+                    }
+                );
+            });
         });
     });
 });
