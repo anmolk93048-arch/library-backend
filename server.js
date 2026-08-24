@@ -676,6 +676,29 @@ function genMaterialUserId(cb) {
         cb(null, 'MU' + String(max + 1).padStart(3, '0'));
     });
 }
+// 🔒 FIX: "duplicate key value violates unique constraint material_users_
+// userid_key" — genMaterialUserId() sirf CURRENT max ID dekh kar agla
+// number sochta hai. Agar do approve-requests (jaise admin ka double-click,
+// ya do alag admin sessions) LAGBHAG EK SAATH aayein, dono ek hi "next" ID
+// compute kar sakte hain — pehla insert safal hota hai, doosra isi duplicate-
+// key error se fail ho jaata hai. Ab yeh helper INSERT ko khud retry karta
+// hai (naya ID lekar) jab bhi yeh EXACT collision ho — user ko kabhi error
+// dikhta hi nahi, aur ID kabhi khaali/wrong nahi rehti.
+function insertMaterialUserWithRetry(buildParams, callback, attemptsLeft) {
+    if (attemptsLeft === undefined) attemptsLeft = 5;
+    genMaterialUserId((idErr, userId) => {
+        if (idErr) return callback(idErr);
+        const { sql, params } = buildParams(userId);
+        db.query(sql, params, (insErr, result) => {
+            if (insErr && insErr.code === '23505' && /userid/i.test(insErr.message || '') && attemptsLeft > 1) {
+                console.warn('⚠️ Material User ID collision (' + userId + ') — naya ID lekar retry kar rahe hain...');
+                return insertMaterialUserWithRetry(buildParams, callback, attemptsLeft - 1);
+            }
+            if (insErr) return callback(insErr);
+            callback(null, result, userId);
+        });
+    });
+}
 function genMuPassword() {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     let pwd = '';
@@ -729,23 +752,21 @@ app.post('/api/material/requests/:id/approve', (req, res) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
         if (!rows || !rows.length) return res.status(404).json({ error: 'Request nahi mili.' });
         const r = rows[0];
-        genMaterialUserId((idErr, userId) => {
-            if (idErr) return res.status(500).json({ error: 'DB error: ' + idErr.message });
-            const plainPassword = genMuPassword();
-            const passwordHash = bcrypt.hashSync(plainPassword, 10);
-            insertWithIdHeal(
-                `INSERT INTO material_users (userId, name, village, address, email, mobile, photo, password_hash, status)
-                 VALUES (?,?,?,?,?,?,?,?, 'active')`,
-                [userId, r.name, r.village, r.address, r.email, r.mobile, r.photo, passwordHash],
-                'material_users',
-                (insErr) => {
-                    if (insErr) return res.status(500).json({ error: 'DB error: ' + insErr.message });
-                    db.query('DELETE FROM material_user_requests WHERE id = ?', [reqId], () => {
-                        res.json({ userId, password: plainPassword });
-                    });
-                }
-            );
-        });
+        const plainPassword = genMuPassword();
+        const passwordHash = bcrypt.hashSync(plainPassword, 10);
+        insertMaterialUserWithRetry(
+            (userId) => ({
+                sql: `INSERT INTO material_users (userId, name, village, address, email, mobile, photo, password_hash, status)
+                      VALUES (?,?,?,?,?,?,?,?, 'active')`,
+                params: [userId, r.name, r.village, r.address, r.email, r.mobile, r.photo, passwordHash]
+            }),
+            (insErr, result, userId) => {
+                if (insErr) return res.status(500).json({ error: 'DB error: ' + insErr.message });
+                db.query('DELETE FROM material_user_requests WHERE id = ?', [reqId], () => {
+                    res.json({ userId, password: plainPassword });
+                });
+            }
+        );
     });
 });
 
@@ -775,20 +796,18 @@ app.post('/api/material/users', (req, res) => {
     db.query('SELECT id FROM material_users WHERE mobile = ?', [mobile], (err, rows) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
         if (rows && rows.length) return res.status(409).json({ error: 'Yeh mobile number pehle se registered hai!' });
-        genMaterialUserId((idErr, userId) => {
-            if (idErr) return res.status(500).json({ error: 'DB error: ' + idErr.message });
-            const passwordHash = bcrypt.hashSync(genMuPassword(), 10);
-            insertWithIdHeal(
-                `INSERT INTO material_users (userId, name, village, mobile, photo, password_hash, status)
-                 VALUES (?,?,?,?,?,?,?)`,
-                [userId, name, village, mobile, photo || null, passwordHash, status || 'active'],
-                'material_users',
-                (insErr) => {
-                    if (insErr) return res.status(500).json({ error: 'DB error: ' + insErr.message });
-                    res.status(201).json({ userId });
-                }
-            );
-        });
+        const passwordHash = bcrypt.hashSync(genMuPassword(), 10);
+        insertMaterialUserWithRetry(
+            (userId) => ({
+                sql: `INSERT INTO material_users (userId, name, village, mobile, photo, password_hash, status)
+                      VALUES (?,?,?,?,?,?,?)`,
+                params: [userId, name, village, mobile, photo || null, passwordHash, status || 'active']
+            }),
+            (insErr, result, userId) => {
+                if (insErr) return res.status(500).json({ error: 'DB error: ' + insErr.message });
+                res.status(201).json({ userId });
+            }
+        );
     });
 });
 
