@@ -1,4 +1,3 @@
-
 const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
@@ -91,6 +90,77 @@ function getAuthUser(req) {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════
+// 🔒 SECURITY LAYER — RBAC middleware + password-hashing helpers
+//   (Advanced Security & Data Protection ke liye)
+// ══════════════════════════════════════════════════════════════════
+
+// RBAC: sirf diye gaye role(s) waale VALID JWT token ke saath hi aage
+// badhne diya jaata hai. Bina token / galat role → turant 401, aage
+// koi bhi route handler chalta hi nahi.
+function requireRole(...roles) {
+    const allowed = roles.map(r => String(r).toLowerCase());
+    return function (req, res, next) {
+        const auth = getAuthUser(req);
+        const role = auth && String(auth.role || '').toLowerCase();
+        if (!auth || !allowed.includes(role)) {
+            return res.status(401).json({ error: 'Is action ke liye sahi login/permission zaroori hai.' });
+        }
+        req.authUser = auth;
+        next();
+    };
+}
+
+// Bcrypt hash "$2a$10$..." jaisa dikhta hai — isse pehchan lete hain ki
+// value already hashed hai ya abhi plain-text hai (legacy data ke liye).
+function looksHashed(pw) {
+    return typeof pw === 'string' && /^\$2[aby]\$\d{2}\$/.test(pw);
+}
+
+// Password field ko har jagah alag naam se store kiya gaya hai
+// (password / pass) — dono cover karte hain.
+const PASSWORD_FIELD_NAMES = ['password', 'pass'];
+
+// Kisi bhi entity-array (admins/staff/agents/students) ko DB mein save
+// karne se PEHLE, agar koi record ka password plain-text mein hai
+// (naya record banaya gaya ho ya purana un-hashed data ho), use turant
+// bcrypt se hash kar dete hain — taaki DB mein KABHI plain-text
+// password store hi na ho.
+function hashEntityPasswordsBeforeSave(value) {
+    if (!Array.isArray(value)) return value;
+    return value.map(rec => {
+        if (!rec || typeof rec !== 'object') return rec;
+        const copy = { ...rec };
+        PASSWORD_FIELD_NAMES.forEach(f => {
+            if (copy[f] && typeof copy[f] === 'string' && !looksHashed(copy[f])) {
+                copy[f] = bcrypt.hashSync(copy[f], 10);
+            }
+        });
+        return copy;
+    });
+}
+
+// API Response Sanitization: frontend ko kabhi bhi password/hash wapas
+// nahi bhejte — chahe hashed hi kyun na ho, ise Network tab mein
+// dikhna hi nahi chahiye. Ek harmless boolean flag (hasPassword) chhod
+// dete hain taaki frontend sirf "credentials bane hain ya nahi" jaan
+// sake, bina asli value dekhe.
+function stripSensitiveFields(value) {
+    if (!Array.isArray(value)) return value;
+    return value.map(rec => {
+        if (!rec || typeof rec !== 'object') return rec;
+        const copy = { ...rec };
+        let had = false;
+        PASSWORD_FIELD_NAMES.forEach(f => {
+            if (copy[f]) had = true;
+            delete copy[f];
+        });
+        delete copy.password_hash;
+        copy.hasPassword = had;
+        return copy;
+    });
+}
+
 // 🆕 PERMANENT FIX for "Block karne par bhi user login/kaam karta rehta hai":
 //   Login-time JWT token 7 din tak valid rehta hai aur usme sirf userId/role
 //   store hota hai — agar Admin kisi CURRENTLY LOGGED-IN user ko beech mein
@@ -102,16 +172,28 @@ function getAuthUser(req) {
 //   intezaar nahi karna padta.
 function requireActiveMaterialUser(req, res, next) {
     const auth = getAuthUser(req);
-    if (!auth || auth.role !== 'material_user' || !auth.userId) {
-        // Token na ho / kisi aur role ka ho — purana behavior hi chalne do
-        // (yeh routes pehle bhi bina is check ke kaam karte the).
+    // 🔒 Admin ko hamesha full access rehta hai (Admin Panel isi route se
+    // kisi bhi user ka bill edit/delete karta hai) — ownership check us
+    // case mein route-level par khud skip ho jaata hai (neeche dekhein).
+    if (auth && String(auth.role || '').toLowerCase() === 'admin') {
+        req.authUser = auth;
         return next();
     }
-    db.query('SELECT status FROM material_users WHERE userId = ?', [auth.userId], (err, rows) => {
+    // 🔒 SECURITY FIX: pehle yahan bina token/galat-role wali request bhi
+    // next() bula kar aage jaane deta tha — matlab material bills
+    // (create/edit/delete) aur mobile-number-change jaisi sensitive
+    // actions BINA KISI LOGIN ke bhi kaam kar jaati thi. Ab yeh middleware
+    // ek asli authentication gate hai: valid material_user token na ho to
+    // seedha 401.
+    if (!auth || auth.role !== 'material_user' || !auth.userId) {
+        return res.status(401).json({ error: 'Login zaroori hai — session expire ho gaya ho sakta hai, dobara login karein.' });
+    }
+    db.query('SELECT status FROM material_users WHERE userid = ?', [auth.userId], (err, rows) => {
         if (err) return next(); // DB check fail ho jaaye to request block mat karo
         if (rows && rows[0] && rows[0].status === 'blocked') {
             return res.status(403).json({ error: 'Yeh ID admin dwara block kar di gayi hai. Aap ab is portal ka istemal nahi kar sakte.' });
         }
+        req.authUser = auth; // 🔒 aage routes isi verified identity ko use karte hain
         next();
     });
 }
@@ -667,11 +749,18 @@ db.getConnection((err, connection) => {
 
 // ── Helpers: MU0001-style userId aur ek random 6-char password ──
 function genMaterialUserId(cb) {
-    db.query("SELECT userId FROM material_users WHERE userId LIKE 'MU%'", (err, rows) => {
+    // 🔒 FIX: Postgres mein unquoted column names hamesha lowercase mein fold
+    // ho jaate hain, isliye query text/result key hamesha "userid" hi hota
+    // hai. Pehle yahan "r.userId" (camelCase) padha jaata tha jo hamesha
+    // undefined milta tha — isliye "max" hamesha 0 rehta tha aur naya ID
+    // hamesha "MU001" hi ban-ta tha (chahe kitne bhi users pehle se ho),
+    // jisse har naye user par duplicate-key collision + retry-exhaustion
+    // (approve/register fail) hota tha.
+    db.query("SELECT userid FROM material_users WHERE userid LIKE 'MU%'", (err, rows) => {
         if (err) return cb(err);
         let max = 0;
         (rows || []).forEach(r => {
-            const num = parseInt(String(r.userId).replace('MU', ''), 10) || 0;
+            const num = parseInt(String(r.userid).replace('MU', ''), 10) || 0;
             if (num > max) max = num;
         });
         cb(null, 'MU' + String(max + 1).padStart(3, '0'));
@@ -757,7 +846,7 @@ app.post('/api/material/requests/:id/approve', (req, res) => {
         const passwordHash = bcrypt.hashSync(plainPassword, 10);
         insertMaterialUserWithRetry(
             (userId) => ({
-                sql: `INSERT INTO material_users (userId, name, village, address, email, mobile, photo, password_hash, status)
+                sql: `INSERT INTO material_users (userid, name, village, address, email, mobile, photo, password_hash, status)
                       VALUES (?,?,?,?,?,?,?,?, 'active')`,
                 params: [userId, r.name, r.village, r.address, r.email, r.mobile, r.photo, passwordHash]
             }),
@@ -781,7 +870,7 @@ app.post('/api/material/requests/:id/reject', (req, res) => {
 
 // 5) Admin: list all material users (Admin Panel table)
 app.get('/api/material/users', (req, res) => {
-    db.query('SELECT id, userId, name, village, address, email, mobile, photo, status, blockedReason, created_at FROM material_users ORDER BY created_at DESC', (err, rows) => {
+    db.query('SELECT id, userid, name, village, address, email, mobile, photo, status, blockedReason, created_at FROM material_users ORDER BY created_at DESC', (err, rows) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
         const mapped = (rows || []).map(u => Object.assign({ _docId: String(u.id) }, u));
         res.json(mapped);
@@ -800,7 +889,7 @@ app.post('/api/material/users', (req, res) => {
         const passwordHash = bcrypt.hashSync(genMuPassword(), 10);
         insertMaterialUserWithRetry(
             (userId) => ({
-                sql: `INSERT INTO material_users (userId, name, village, mobile, photo, password_hash, status)
+                sql: `INSERT INTO material_users (userid, name, village, mobile, photo, password_hash, status)
                       VALUES (?,?,?,?,?,?,?)`,
                 params: [userId, name, village, mobile, photo || null, passwordHash, status || 'active']
             }),
@@ -837,7 +926,7 @@ app.put('/api/material/users/:id', (req, res) => {
 //     12 second mein poll karta hai taaki photo/status turant update ho jaaye)
 app.get('/api/material/users/:id', (req, res) => {
     db.query(
-        'SELECT id, userId, name, village, address, email, mobile, photo, status, blockedReason, created_at FROM material_users WHERE id = ?',
+        'SELECT id, userid, name, village, address, email, mobile, photo, status, blockedReason, created_at FROM material_users WHERE id = ?',
         [req.params.id],
         (err, rows) => {
             if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
@@ -868,7 +957,7 @@ app.post('/api/material/login', (req, res) => {
         // — request backend tak pahunchi, par server hi crash ho gaya.
         const secondFactor = req.body && req.body.secondFactor != null ? String(req.body.secondFactor) : '';
         if (!userId || !secondFactor) return res.status(400).json({ error: 'User ID aur Mobile/Password dono zaroori hain.' });
-        db.query('SELECT * FROM material_users WHERE userId = ?', [String(userId)], (err, rows) => {
+        db.query('SELECT * FROM material_users WHERE userid = ?', [String(userId)], (err, rows) => {
             try {
                 if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
                 if (!rows || !rows.length) return res.status(404).json({ error: 'Yeh User ID registered nahi hai.' });
@@ -883,7 +972,14 @@ app.post('/api/material/login', (req, res) => {
                 if (!mobileMatches && !passwordMatches) {
                     return res.status(401).json({ error: 'Galat Mobile Number ya Password.' });
                 }
-                const token = jwt.sign({ userId: u.userId, role: 'material_user' }, JWT_SECRET, { expiresIn: '7d' });
+                // 🔒 FIX: pehle "u.userId" (camelCase) padha jaata tha jo Postgres
+                // row mein hamesha undefined hota hai (asli key "userid" hai) —
+                // isliye JWT token mein userId hamesha undefined save ho raha tha.
+                // Isi wajah se requireActiveMaterialUser() middleware ka block-check
+                // hamesha skip ho jaata tha (blocked user bhi login ke baad kaam
+                // karta rehta tha), aur "मोबाइल नंबर बदलें" route bhi हमेशा
+                // "Yeh User ID nahi mila" error deta tha.
+                const token = jwt.sign({ userId: u.userid, role: 'material_user' }, JWT_SECRET, { expiresIn: '7d' });
                 const { password_hash, ...userSafe } = u;
                 userSafe._docId = String(u.id);
                 res.json({ user: userSafe, token });
@@ -919,7 +1015,7 @@ app.post('/api/material/change-mobile', requireActiveMaterialUser, (req, res) =>
         if (digitsOnly.length !== 10) {
             return res.status(400).json({ error: 'Kripya sahi 10-digit mobile number dalein.' });
         }
-        db.query('SELECT id, mobile FROM material_users WHERE userId = ?', [auth.userId], (err, rows) => {
+        db.query('SELECT id, mobile FROM material_users WHERE userid = ?', [auth.userId], (err, rows) => {
             if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
             if (!rows || !rows.length) return res.status(404).json({ error: 'Yeh User ID nahi mila.' });
             const me = rows[0];
@@ -947,11 +1043,110 @@ app.post('/api/material/change-mobile', requireActiveMaterialUser, (req, res) =>
 //   data ke against) hota hai; yeh route sirf ek session token deta hai
 //   taaki wallet/salary jaisi identity-based routes kaam kar sakein.
 // ══════════════════════════════════════════════════════════════════
+// 🔒 SECURITY FIX: pehle yeh route BINA KISI PASSWORD CHECK ke, client jo
+// bhi role/username bheje usी ke liye ek VALID JWT token bana kar de deta
+// tha — matlab koi bhi {role:'admin'} bhej kar asli Admin token le sakta
+// tha. Ab yeh route DB mein saved (bcrypt-hashed) password/mobile se
+// asli verification karta hai, tabhi token issue hota hai.
+const AUTH_ENTITY_FOR_ROLE = { admin: 'admins', staff: 'staff', agent: 'agents' };
+
+// ══════════════════════════════════════════════════════════════════
+// 🔑 FIRST-ADMIN BOOTSTRAP — jab 'admins' entity bilkul KHAALI ho (naya
+//   deployment, ya galti se saara admin data delete ho jaaye), tab
+//   /api/auth/login kabhi kisi ko login nahi karne dega (koi record hi
+//   match nahi hoga) — poora system permanently lock ho jaata. Yeh
+//   route SIRF tabhi kaam karta hai jab: (1) admins list khaali ho,
+//   AUR (2) Render Environment mein ADMIN_BOOTSTRAP_SECRET set ho aur
+//   request usी secret ke saath aaye. Agar env var set hi nahi hai, yeh
+//   route hamesha 403 dega — matlab yeh feature by-default OFF hai,
+//   sirf jaan-boojh kar enable karne par hi kaam karta hai.
+// ══════════════════════════════════════════════════════════════════
+app.post('/api/auth/bootstrap-admin', (req, res) => {
+    if (!process.env.ADMIN_BOOTSTRAP_SECRET) {
+        return res.status(403).json({ error: 'Bootstrap feature enable nahi hai. Render → Environment mein ADMIN_BOOTSTRAP_SECRET set karein.' });
+    }
+    const { secret, username, password, name } = req.body || {};
+    if (secret !== process.env.ADMIN_BOOTSTRAP_SECRET) {
+        return res.status(403).json({ error: 'Galat bootstrap secret.' });
+    }
+    if (!username || !password) return res.status(400).json({ error: 'username aur password zaroori hain.' });
+    db.query('SELECT value FROM kv_admin_entities WHERE `key` = ?', ['admins'], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        let list = [];
+        try { list = JSON.parse(rows[0] && rows[0].value) || []; } catch (e) { list = []; }
+        if (list && list.length) {
+            return res.status(409).json({ error: 'Admins pehle se maujood hain — bootstrap sirf khaali list par chalta hai. Normal login ya Admin Panel se naya admin add karein.' });
+        }
+        const newAdmin = { username, name: name || username, password: bcrypt.hashSync(password, 10), lastLogin: null };
+        db.query(
+            'INSERT INTO kv_admin_entities ("key", value) VALUES (?, ?) ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value',
+            ['admins', JSON.stringify([newAdmin])],
+            (insErr) => {
+                if (insErr) return res.status(500).json({ error: 'DB error: ' + insErr.message });
+                res.status(201).json({ success: true });
+            }
+        );
+    });
+});
+
 app.post('/api/auth/login', (req, res) => {
-    const { role, username } = req.body || {};
-    if (!role || !username) return res.status(400).json({ error: 'role aur username zaroori hain.' });
-    const token = jwt.sign({ role, username }, JWT_SECRET, { expiresIn: '7d' });
-    res.json({ token });
+    const { role, username, password, mobile } = req.body || {};
+    const roleKey = String(role || '').toLowerCase();
+    if (!roleKey || !username) return res.status(400).json({ error: 'role aur username zaroori hain.' });
+
+    // ── Student role: password nahi hota, mobile-match hi verification hai
+    //    (poore app mein students ke liye yehi pattern istemal hota hai) ──
+    if (roleKey === 'student') {
+        if (!mobile) return res.status(400).json({ error: 'Mobile number zaroori hai.' });
+        db.query('SELECT value FROM kv_admin_entities WHERE `key` = ?', ['students'], (err, rows) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            let list = [];
+            try { list = JSON.parse(rows[0] && rows[0].value) || []; } catch (e) { list = []; }
+            const wantMobile = String(mobile).replace(/\D/g, '').slice(-10);
+            const stud = (list || []).find(s => s && (String(s.id) === String(username) || String(s.studentId) === String(username)));
+            const studMobile = stud && String(stud.mobile || stud.phone || '').replace(/\D/g, '').slice(-10);
+            if (!stud || !studMobile || studMobile !== wantMobile) {
+                return res.status(401).json({ error: 'Student ID ya Mobile number match nahi kar raha.' });
+            }
+            const token = jwt.sign({ role: 'student', username: String(username) }, JWT_SECRET, { expiresIn: '7d' });
+            res.json({ token });
+        });
+        return;
+    }
+
+    // ── Admin / Staff / Agent: password-based verification ──
+    const entityKey = AUTH_ENTITY_FOR_ROLE[roleKey];
+    if (!entityKey) return res.status(400).json({ error: 'Invalid role.' });
+    if (!password) return res.status(400).json({ error: 'Password zaroori hai.' });
+    db.query('SELECT value FROM kv_admin_entities WHERE `key` = ?', [entityKey], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        let list = [];
+        try { list = JSON.parse(rows[0] && rows[0].value) || []; } catch (e) { list = []; }
+        const idx = (list || []).findIndex(u => u && u.username === username);
+        const user = idx >= 0 ? list[idx] : null;
+        if (!user || !user.password) return res.status(401).json({ error: 'Galat username ya password!' });
+
+        let ok = false;
+        if (looksHashed(user.password)) {
+            ok = bcrypt.compareSync(password, user.password);
+        } else {
+            // Legacy plain-text record (purana data) — verify karke turant
+            // hash mein upgrade kar dete hain, taaki agli baar se DB mein
+            // kabhi plain-text na rahe.
+            ok = user.password === password;
+            if (ok) {
+                list[idx] = { ...user, password: bcrypt.hashSync(password, 10) };
+                db.query(
+                    'INSERT INTO kv_admin_entities ("key", value) VALUES (?, ?) ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value',
+                    [entityKey, JSON.stringify(list)],
+                    () => {}
+                );
+            }
+        }
+        if (!ok) return res.status(401).json({ error: 'Galat username ya password!' });
+        const token = jwt.sign({ role: roleKey, username: String(username) }, JWT_SECRET, { expiresIn: '7d' });
+        res.json({ token });
+    });
 });
 
 // ══════════════════════════════════════════════════════════════════
@@ -959,6 +1154,13 @@ app.post('/api/auth/login', (req, res) => {
 //   (Admin Panel ke FBSync.pull/push isi se judte hain)
 // ══════════════════════════════════════════════════════════════════
 const ENTITY_KEYS = ['admins', 'staff', 'agents', 'students', 'agent_logins'];
+// 🔒 Secrets/config jo kabhi bhi bina Admin login ke GET bhi nahi hone
+// chahiye (jaise Razorpay/SMS API keys) — baaki blob keys (settings,
+// notices, waghera) public site ke liye read-open rehte hain jaisa
+// pehle tha.
+const ADMIN_ONLY_READ_BLOB_KEYS = ['razorpay_config', 'sms_api_config', 'hrms_registrations',
+    'staff_att', 'leave_requests', 'agent_payments', 'agent_pending_registrations',
+    'customer_pending_registrations'];
 const BLOB_KEYS = ['settings', 'activity', 'notices', 'mem_plans', 'members',
     'hrms_registrations', 'staff_att', 'leave_requests', 'agent_plans', 'agent_payments',
     'razorpay_config', 'sms_api_config', 'agent_pending_registrations', 'customer_pending_registrations'];
@@ -969,11 +1171,18 @@ function kvGet(table, key, res, wrapValue) {
         if (!rows || !rows.length) return res.json(wrapValue ? null : null);
         let parsed = null;
         try { parsed = JSON.parse(rows[0].value); } catch (e) { parsed = rows[0].value; }
+        // 🔒 API Response Sanitization: entity-store (admins/staff/agents/
+        // students) mein password kabhi Network tab tak nahi pahunchta.
+        if (table === 'kv_admin_entities') parsed = stripSensitiveFields(parsed);
         res.json(parsed);
     });
 }
 function kvSet(table, key, value, res) {
-    const json = JSON.stringify(value);
+    // 🔒 Password Hashing: entity-store mein jo bhi naya/edited record
+    // aaye, save hone se pehle uska password bcrypt se hash ho jaata hai
+    // — DB mein kabhi plain-text password store nahi hota.
+    const toSave = table === 'kv_admin_entities' ? hashEntityPasswordsBeforeSave(value) : value;
+    const json = JSON.stringify(toSave);
     db.query(
         `INSERT INTO ${table} ("key", value) VALUES (?, ?) ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value`,
         [key, json],
@@ -984,24 +1193,42 @@ function kvSet(table, key, value, res) {
     );
 }
 
+
 app.get('/api/admin-entities/:key', (req, res) => {
     if (!ENTITY_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown entity key' });
     kvGet('kv_admin_entities', req.params.key, res);
 });
+// 🔒 RBAC: Admin har entity likh sakta hai. Agent/Staff sirf 'students'
+// entity manage kar sakte hain (apne students add/edit karne ke liye —
+// yeh app ka existing legitimate flow hai). Bina login / kisi aur
+// role/key combination par turant 401.
 app.post('/api/admin-entities/:key', (req, res) => {
     if (!ENTITY_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown entity key' });
+    const auth = getAuthUser(req);
+    const role = auth && String(auth.role || '').toLowerCase();
+    const allowed = role === 'admin' || ((role === 'agent' || role === 'staff') && req.params.key === 'students');
+    if (!allowed) return res.status(401).json({ error: 'Is data ko badalne ke liye sahi login/permission zaroori hai.' });
     kvSet('kv_admin_entities', req.params.key, req.body, res);
 });
 
 app.get('/api/blob/:key', (req, res) => {
     if (!BLOB_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown blob key' });
+    // 🔒 Secrets (Razorpay/SMS keys) aur internal HR/agent data sirf Admin
+    // login ke saath hi padhe ja sakte hain — baaki (settings/notices etc.)
+    // public site ke liye pehle jaisa hi khula rehta hai.
+    if (ADMIN_ONLY_READ_BLOB_KEYS.includes(req.params.key)) {
+        const auth = getAuthUser(req);
+        if (!auth || String(auth.role || '').toLowerCase() !== 'admin') {
+            return res.status(401).json({ error: 'Is data ko dekhne ke liye Admin login zaroori hai.' });
+        }
+    }
     kvGet('kv_blob', req.params.key, res);
 });
-app.post('/api/blob/:key', (req, res) => {
+app.post('/api/blob/:key', requireRole('admin'), (req, res) => {
     if (!BLOB_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown blob key' });
     kvSet('kv_blob', req.params.key, req.body, res);
 });
-app.delete('/api/blob/:key', (req, res) => {
+app.delete('/api/blob/:key', requireRole('admin'), (req, res) => {
     db.query('DELETE FROM kv_blob WHERE `key` = ?', [req.params.key], (err) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
         res.json({ success: true });
@@ -1202,7 +1429,14 @@ app.post('/api/agent-registrations', (req, res) => {
                 return res.status(409).json({ error: 'Is username se ek registration pehle se hi Admin approval ka wait kar raha hai.' });
             }
             const rec = {
-                id: 'REG' + Date.now(), name, username: uname, password, mobile: mobile || '', company: company || '',
+                id: 'REG' + Date.now(), name, username: uname,
+                // 🔒 Password Hashing: pending registration mein bhi
+                // password kabhi plain-text save nahi hota — turant bcrypt
+                // hash. Admin approve karega to yahi hash 'agents' list
+                // mein copy ho jaata hai (dobara hash nahi hoga, looksHashed()
+                // ise pehchan lega).
+                password: bcrypt.hashSync(password, 10),
+                mobile: mobile || '', company: company || '',
                 status: 'pending', submittedOn: new Date().toISOString()
             };
             pending.push(rec);
@@ -1878,7 +2112,7 @@ app.get('/api/subscription-status/:identifier', (req, res) => {
 // button isi route ko call karta hai. Payment ke bina bhi subExpiry ko
 // aage badha deta hai (5-10 din request par) — kisi bhi data ko chhuta
 // nahi, sirf yeh ek date field update hoti hai.
-app.post('/api/admin/extend-agent-validity', (req, res) => {
+app.post('/api/admin/extend-agent-validity', requireRole('admin'), (req, res) => {
     const { agentId, days } = req.body || {};
     if (!agentId) return res.status(400).json({ error: 'agentId zaroori hai.' });
     const extendDays = Math.min(Math.max(parseInt(days, 10) || 7, 1), 30); // 1-30 din ke beech, safety cap
@@ -2111,10 +2345,9 @@ app.post('/api/hrms-salary/claims', (req, res) => {
     );
 });
 // Staff claim → Agent verifies (deduct agent wallet)
-app.post('/api/wallet/salary-claims/:id/verify', (req, res) => {
-    const auth = getAuthUser(req);
-    const agentId = auth ? auth.username : (req.body && req.body.agentId);
-    if (!agentId) return res.status(401).json({ error: 'Agent identity nahi mili — dobara login karein.' });
+app.post('/api/wallet/salary-claims/:id/verify', requireRole('agent', 'admin'), (req, res) => {
+    const auth = req.authUser;
+    const agentId = auth.username;
     db.query("SELECT * FROM hrms_salary_claims WHERE id=? AND status='pending'", [req.params.id], (err, rows) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
         if (!rows || !rows.length) return res.status(404).json({ error: 'Claim pending nahi mila.' });
@@ -2134,7 +2367,7 @@ app.post('/api/wallet/salary-claims/:id/verify', (req, res) => {
     });
 });
 // Admin final approve → generates payslip
-app.post('/api/hrms-salary/claims/:id/approve', (req, res) => {
+app.post('/api/hrms-salary/claims/:id/approve', requireRole('admin'), (req, res) => {
     db.query("SELECT * FROM hrms_salary_claims WHERE id=? AND (status='pending' OR status='pending_admin')", [req.params.id], (err, rows) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
         if (!rows || !rows.length) return res.status(400).json({ error: 'Yeh claim pending nahi hai (already processed).' });
@@ -2148,7 +2381,7 @@ app.post('/api/hrms-salary/claims/:id/approve', (req, res) => {
         });
     });
 });
-app.post('/api/hrms-salary/claims/:id/reject', (req, res) => {
+app.post('/api/hrms-salary/claims/:id/reject', requireRole('admin'), (req, res) => {
     db.query("UPDATE hrms_salary_claims SET status='rejected' WHERE id=? AND status IN ('pending','pending_admin')", [req.params.id], (err, result) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
         if (!result.affectedRows) return res.status(400).json({ error: 'Yeh claim pending nahi hai (already processed).' });
@@ -2220,13 +2453,13 @@ app.post('/api/wallet/withdraw', (req, res) => {
     });
 });
 // Admin: list all withdrawals + approve/reject
-app.get('/api/wallet/withdrawals', (req, res) => {
+app.get('/api/wallet/withdrawals', requireRole('admin'), (req, res) => {
     db.query('SELECT * FROM wallet_withdrawals ORDER BY created_at DESC', (err, rows) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
         res.json(rows || []);
     });
 });
-app.post('/api/wallet/withdrawal/:id/process', (req, res) => {
+app.post('/api/wallet/withdrawal/:id/process', requireRole('admin'), (req, res) => {
     const { action, reason } = req.body || {};
     db.query("SELECT * FROM wallet_withdrawals WHERE id=? AND status='pending'", [req.params.id], (err, rows) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
@@ -2251,7 +2484,7 @@ app.post('/api/wallet/withdrawal/:id/process', (req, res) => {
     });
 });
 // Admin: student→agent direct-collect payments summary (today/month)
-app.get('/api/wallet/agent-direct-payments', (req, res) => {
+app.get('/api/wallet/agent-direct-payments', requireRole('admin'), (req, res) => {
     db.query(
         `SELECT
             SUM(CASE WHEN created_at::date = CURRENT_DATE THEN amount ELSE 0 END) AS today_total,
@@ -2275,8 +2508,18 @@ app.get('/api/wallet/agent-direct-payments', (req, res) => {
 // ══════════════════════════════════════════════════════════════════
 app.post('/api/material/bills', requireActiveMaterialUser, (req, res) => {
     const body = req.body || {};
-    const ownerUserId = body.ownerUserId;
+    // 🔒 SECURITY FIX: pehle ownerUserId client ke request body se seedha
+    // trust ho jaata tha — koi bhi logged-in material user, body mein
+    // KISI AUR ka userId bhej kar unke naam par bill save kar sakta tha.
+    // Ab yeh hamesha verified JWT identity (req.authUser.userId) se
+    // aata hai, client jo bhi body mein bheje uska koi asar nahi. (Admin
+    // ke liye — jiska apna koi material userId nahi hota — client-supplied
+    // ownerUserId hi allow karte hain, kyunki Admin doosre users ki taraf
+    // se save kar sakta hai.)
+    const isAdmin = String(req.authUser.role || '').toLowerCase() === 'admin';
+    const ownerUserId = isAdmin ? body.ownerUserId : req.authUser.userId;
     if (!ownerUserId) return res.status(400).json({ error: 'ownerUserId zaroori hai.' });
+    body.ownerUserId = ownerUserId;
     // 🆕 FIX: pehle yahan har save par HAMESHA naya row INSERT hota tha —
     // chahe wahi Bill No dobara save kiya jaaye. Frontend isi behavior ki
     // ummeed karta hai ki ownerUserId + billNo match hone par UPDATE ho,
@@ -2287,7 +2530,7 @@ app.post('/api/material/bills', requireActiveMaterialUser, (req, res) => {
     const findExisting = (cb) => {
         if (!billNo) return cb(null); // Bill No khaali hai — hamesha naya bill
         db.query(
-            "SELECT id FROM material_bills WHERE ownerUserId=? AND (data::json->>'billNo')=? LIMIT 1",
+            "SELECT id FROM material_bills WHERE owneruserid=? AND (data::json->>'billNo')=? LIMIT 1",
             [ownerUserId, billNo],
             (err, rows) => cb(err ? null : (rows && rows[0] ? rows[0].id : null))
         );
@@ -2299,7 +2542,7 @@ app.post('/api/material/bills', requireActiveMaterialUser, (req, res) => {
                 res.status(200).json({ id: existingId, updated: true });
             });
         } else {
-            db.query('INSERT INTO material_bills (ownerUserId, data) VALUES (?,?)', [ownerUserId, JSON.stringify(body)], (err, result) => {
+            db.query('INSERT INTO material_bills (owneruserid, data) VALUES (?,?)', [ownerUserId, JSON.stringify(body)], (err, result) => {
                 if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
                 res.status(201).json({ id: result.insertId, updated: false });
             });
@@ -2321,22 +2564,25 @@ app.get('/api/material/bills', (req, res) => {
             return res.status(401).json({ error: 'Sirf Admin login se hi sabhi users ke invoices dekhe ja sakte hain.' });
         }
     }
-    const sql = ownerUserId ? 'SELECT * FROM material_bills WHERE ownerUserId=? ORDER BY savedAt DESC' : 'SELECT * FROM material_bills ORDER BY savedAt DESC';
+    const sql = ownerUserId ? 'SELECT * FROM material_bills WHERE owneruserid=? ORDER BY savedAt DESC' : 'SELECT * FROM material_bills ORDER BY savedAt DESC';
     db.query(sql, ownerUserId ? [ownerUserId] : [], (err, rows) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
         res.json((rows || []).map(r => { try { return Object.assign(JSON.parse(r.data), { id: r.id, savedAt: r.savedAt }); } catch (e) { return { id: r.id, savedAt: r.savedAt }; } }));
     });
 });
 app.put('/api/material/bills/:id', requireActiveMaterialUser, (req, res) => {
-    db.query('SELECT ownerUserId, data FROM material_bills WHERE id=?', [req.params.id], (err, rows) => {
+    db.query('SELECT owneruserid, data FROM material_bills WHERE id=?', [req.params.id], (err, rows) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
         if (!rows || !rows.length) return res.status(404).json({ error: 'Bill nahi mila.' });
-        // 🆕 SECURITY FIX: pehle koi bhi logged-in material user, ID guess
-        // karke doosre user ka bill edit kar sakta tha. Ab check karte hain
-        // ki jo ownerUserId request mein bheja gaya hai, wahi is bill ka
-        // asli malik ho — warna edit reject ho jaayega.
-        const requestOwnerId = (req.body || {}).ownerUserId;
-        if (requestOwnerId && rows[0].ownerUserId && requestOwnerId !== rows[0].ownerUserId) {
+        // 🔒 SECURITY FIX: pehle client body ke ownerUserId par bharosa
+        // hota tha (jo khud client hi bhejta hai — spoof karna trivial
+        // tha), aur us par bhi "rows[0].ownerUserId" (camelCase) hamesha
+        // undefined milne ki wajah se yeh check kabhi trigger hi nahi
+        // hota tha. Ab verified JWT identity (req.authUser.userId) se
+        // asli malik match hota hai.
+        const requestOwnerId = req.authUser.userId; // undefined for admin — check skip ho jaata hai neeche
+        const isAdmin = String(req.authUser.role || '').toLowerCase() === 'admin';
+        if (!isAdmin && rows[0].owneruserid && requestOwnerId !== rows[0].owneruserid) {
             return res.status(403).json({ error: 'Yeh bill aapka nahi hai — edit nahi kar sakte.' });
         }
         let merged = {};
@@ -2349,9 +2595,22 @@ app.put('/api/material/bills/:id', requireActiveMaterialUser, (req, res) => {
     });
 });
 app.delete('/api/material/bills/:id', requireActiveMaterialUser, (req, res) => {
-    db.query('DELETE FROM material_bills WHERE id=?', [req.params.id], (err) => {
-        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
-        res.json({ success: true });
+    // 🔒 SECURITY FIX: pehle yahan koi ownership check hi nahi tha — koi
+    // bhi logged-in material user, kisi bhi ID ka bill (kisi doosre user
+    // ka bhi) seedha delete kar sakta tha. Ab verified JWT identity se
+    // check karte hain ki bill isi user ka hai (Admin ke liye check
+    // skip ho jaata hai — Admin kisi ka bhi bill delete kar sakta hai).
+    const isAdmin = String(req.authUser.role || '').toLowerCase() === 'admin';
+    db.query('SELECT owneruserid FROM material_bills WHERE id=?', [req.params.id], (selErr, rows) => {
+        if (selErr) return res.status(500).json({ error: 'DB error: ' + selErr.message });
+        if (!rows || !rows.length) return res.status(404).json({ error: 'Bill nahi mila.' });
+        if (!isAdmin && rows[0].owneruserid && req.authUser.userId !== rows[0].owneruserid) {
+            return res.status(403).json({ error: 'Yeh bill aapka nahi hai — delete nahi kar sakte.' });
+        }
+        db.query('DELETE FROM material_bills WHERE id=?', [req.params.id], (err) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            res.json({ success: true });
+        });
     });
 });
 
