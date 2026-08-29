@@ -1162,8 +1162,18 @@ app.post('/api/auth/login', (req, res) => {
             if (!emp || !empMobile || empMobile !== wantMobile) {
                 return res.status(401).json({ error: 'Employee ID ya Mobile number match nahi kar raha.' });
             }
+            // 🔒 FIX (Issue #3 — verification check in login): sirf wahi
+            // employee login kar sakta hai jiska Admin verification poora
+            // ho chuka ho (status==='active'). Yeh record yahan 'hrms_employees'
+            // mein sirf tabhi aata hai jab Admin verify kar chuka ho (dekhein
+            // ADMIN_APPROVE_STAFF / /api/hr/registrations/:id/approve) — agar
+            // kisi wajah se koi record 'pending'/kisi aur status mein ho, to
+            // login yahan bhi explicitly block hota hai, saaf error ke saath.
             if (emp.status === 'inactive' || emp.status === 'blocked') {
                 return res.status(403).json({ error: 'Yeh Employee ID block/inactive hai. Admin se sampark karein.' });
+            }
+            if (emp.status && emp.status !== 'active') {
+                return res.status(403).json({ error: 'Aapka Admin verification abhi pending hai. Verify hone ke baad hi login kar payenge.' });
             }
             const token = jwt.sign({ role: 'employee', username: String(username).toUpperCase() }, JWT_SECRET, { expiresIn: '7d' });
             res.json({ token });
