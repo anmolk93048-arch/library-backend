@@ -576,6 +576,39 @@ db.getConnection((err, connection) => {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         `],
+        // ══════════════════════════════════════════════════════════════
+        // 🆕 PFMS (Accountant) PORTAL — Agent payout request → HRMS/Staff
+        //   approval → PFMS "Pay Now" (wallet debit + ledger entry).
+        //   PFMS login credentials Admin banata hai (bcrypt-hashed password,
+        //   'admins' table jaisa hi pattern).
+        // ══════════════════════════════════════════════════════════════
+        ['pfms_users', `
+            CREATE TABLE IF NOT EXISTS pfms_users (
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(100) UNIQUE NOT NULL,
+                name VARCHAR(255),
+                password_hash VARCHAR(255) NOT NULL,
+                status VARCHAR(20) DEFAULT 'active',
+                created_by_admin VARCHAR(100),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `],
+        ['payout_requests', `
+            CREATE TABLE IF NOT EXISTS payout_requests (
+                id VARCHAR(50) PRIMARY KEY,
+                agentId VARCHAR(100) NOT NULL,
+                agentName VARCHAR(255),
+                amount DECIMAL(12,2) NOT NULL,
+                reason VARCHAR(500),
+                status VARCHAR(20) DEFAULT 'Pending',
+                hr_approved_by VARCHAR(100),
+                hr_approved_at TIMESTAMP,
+                pfms_paid_by VARCHAR(100),
+                pfms_paid_at TIMESTAMP,
+                rejected_reason VARCHAR(500),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `],
         // 🆕 Student subscription Razorpay orders — jab order create hota hai
         // tabhi studentId/planId/days yahan save ho jaate hain, taaki verify
         // step client se dobara yeh values na maange (jo tamper ho sakti thin)
@@ -1114,6 +1147,46 @@ app.post('/api/auth/login', (req, res) => {
         return;
     }
 
+    // ── Employee (HRMS) role: password nahi hota, Employee ID + mobile
+    //    match hi verification hai — 'hrms_employees' blob se check karte
+    //    hain (Firebase ki jagah Postgres). ──
+    if (roleKey === 'employee') {
+        if (!mobile) return res.status(400).json({ error: 'Mobile number zaroori hai.' });
+        db.query('SELECT value FROM kv_blob WHERE `key` = ?', ['hrms_employees'], (err, rows) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            let list = [];
+            try { list = JSON.parse(rows[0] && rows[0].value) || []; } catch (e) { list = []; }
+            const wantMobile = String(mobile).replace(/\D/g, '').slice(-10);
+            const emp = (list || []).find(e => e && String(e.empId || '').toUpperCase() === String(username).toUpperCase());
+            const empMobile = emp && String(emp.phone || emp.mobile || '').replace(/\D/g, '').slice(-10);
+            if (!emp || !empMobile || empMobile !== wantMobile) {
+                return res.status(401).json({ error: 'Employee ID ya Mobile number match nahi kar raha.' });
+            }
+            if (emp.status === 'inactive' || emp.status === 'blocked') {
+                return res.status(403).json({ error: 'Yeh Employee ID block/inactive hai. Admin se sampark karein.' });
+            }
+            const token = jwt.sign({ role: 'employee', username: String(username).toUpperCase() }, JWT_SECRET, { expiresIn: '7d' });
+            res.json({ token });
+        });
+        return;
+    }
+
+    // ── PFMS (Accountant): password-based, apni alag SQL table se (Admin
+    //    dwara banaye gaye credentials) ──
+    if (roleKey === 'pfms') {
+        if (!password) return res.status(400).json({ error: 'Password zaroori hai.' });
+        db.query('SELECT * FROM pfms_users WHERE username = ?', [username], (err, rows) => {
+            if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+            const u = rows && rows[0];
+            if (!u) return res.status(401).json({ error: 'Galat username ya password!' });
+            if (u.status === 'inactive') return res.status(403).json({ error: 'Yeh account Admin dwara inactive kar diya gaya hai.' });
+            if (!bcrypt.compareSync(password, u.password_hash)) return res.status(401).json({ error: 'Galat username ya password!' });
+            const token = jwt.sign({ role: 'pfms', username: u.username }, JWT_SECRET, { expiresIn: '7d' });
+            res.json({ token });
+        });
+        return;
+    }
+
     // ── Admin / Staff / Agent: password-based verification ──
     const entityKey = AUTH_ENTITY_FOR_ROLE[roleKey];
     if (!entityKey) return res.status(400).json({ error: 'Invalid role.' });
@@ -1157,13 +1230,36 @@ const ENTITY_KEYS = ['admins', 'staff', 'agents', 'students', 'agent_logins'];
 // 🔒 Secrets/config jo kabhi bhi bina Admin login ke GET bhi nahi hone
 // chahiye (jaise Razorpay/SMS API keys) — baaki blob keys (settings,
 // notices, waghera) public site ke liye read-open rehte hain jaisa
-// pehle tha.
-const ADMIN_ONLY_READ_BLOB_KEYS = ['razorpay_config', 'sms_api_config', 'hrms_registrations',
-    'staff_att', 'leave_requests', 'agent_payments', 'agent_pending_registrations',
-    'customer_pending_registrations'];
+// pehle tha. 'staff_att'/'leave_requests' ab Employee/Agent/Admin teeno
+// padh sakte hain (HRMS self-service portal ke liye zaroori), baaki sab
+// sirf Admin.
+// 🔓 'razorpay_config' mein sirf PUBLIC keyId + orderEndpoint hote hain
+// (koi secret key nahi — Razorpay secret hamesha server-side hi rehta
+// hai) — isliye yeh public-read hai (Agent/Student ko apna subscription/
+// fee payment shuru karne ke liye chahiye).
+const ADMIN_ONLY_READ_BLOB_KEYS = ['sms_api_config', 'hrms_registrations',
+    'agent_payments', 'agent_pending_registrations',
+    'customer_pending_registrations', 'hrms_pending_registrations'];
+// 🔒 Kuch blob-keys par Employee ko sirf PADHNE ki, likhne ki nahi,
+// permission honi chahiye (jaise salary slips — Admin/Agent generate
+// karte hain, Employee sirf apni slip dekhta hai). Isliye READ aur
+// WRITE ke liye alag role-lists rakhte hain. 'hrms_settings' company
+// branding jaisi non-sensitive info hoti hai jo LOGIN SE PEHLE bhi
+// chahiye (naye visitor ko bhi company naam/logo dikhta hai), isliye
+// GET public-read hi rehta hai — sirf WRITE role-restricted hai.
+const MULTI_ROLE_READ_BLOB_KEYS = { staff_att: ['admin', 'agent', 'employee'], leave_requests: ['admin', 'agent', 'employee'], hrms_salary_slips: ['admin', 'agent', 'employee'], hrms_attendance: ['admin', 'agent', 'employee'], hrms_leaves: ['admin', 'agent', 'employee'], hrms_salary_claims: ['admin', 'agent', 'employee'], att_records: ['admin', 'agent'], student_photos: ['admin', 'agent'], selfies: ['admin', 'agent'], attendance_locations: ['admin', 'agent'], comments: ['admin', 'agent'], att_monthly_summary: ['admin', 'agent'], fee_records: ['admin', 'agent'], pending_staff: ['admin', 'agent'], salary_claims: ['admin', 'agent'] };
+// 🔒 att_records/selfies/attendance_locations/student_photos par STUDENT
+// khud likhta hai (apni attendance mark karte waqt selfie/GPS) — isliye
+// WRITE mein 'student' role bhi shaamil hai, lekin READ (poori list dekhna)
+// sirf Admin/Agent ke paas hi hai.
+const MULTI_ROLE_WRITE_BLOB_KEYS = { staff_att: ['admin', 'agent', 'employee'], leave_requests: ['admin', 'agent', 'employee'], hrms_salary_slips: ['admin', 'agent'], hrms_settings: ['admin', 'agent'], hrms_attendance: ['admin', 'agent', 'employee'], hrms_leaves: ['admin', 'agent', 'employee'], hrms_salary_claims: ['admin', 'agent', 'employee'], att_records: ['admin', 'agent', 'student'], student_photos: ['admin', 'agent', 'student'], selfies: ['admin', 'agent', 'student'], attendance_locations: ['admin', 'agent', 'student'], comments: ['admin', 'agent'], att_monthly_summary: ['admin', 'agent'], fee_records: ['admin', 'agent'], pending_staff: ['admin', 'agent'], salary_claims: ['admin', 'agent'] };
 const BLOB_KEYS = ['settings', 'activity', 'notices', 'mem_plans', 'members',
     'hrms_registrations', 'staff_att', 'leave_requests', 'agent_plans', 'agent_payments',
-    'razorpay_config', 'sms_api_config', 'agent_pending_registrations', 'customer_pending_registrations'];
+    'razorpay_config', 'sms_api_config', 'agent_pending_registrations', 'customer_pending_registrations',
+    'hrms_employees', 'hrms_pending_registrations', 'hrms_salary_slips', 'hrms_settings',
+    'hrms_attendance', 'hrms_leaves', 'hrms_salary_claims',
+    'att_records', 'student_photos', 'selfies', 'attendance_locations', 'comments', 'att_monthly_summary',
+    'fee_records', 'pending_staff', 'salary_claims'];
 
 function kvGet(table, key, res, wrapValue) {
     db.query(`SELECT value FROM ${table} WHERE \`key\` = ?`, [key], (err, rows) => {
@@ -1206,7 +1302,7 @@ app.post('/api/admin-entities/:key', (req, res) => {
     if (!ENTITY_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown entity key' });
     const auth = getAuthUser(req);
     const role = auth && String(auth.role || '').toLowerCase();
-    const allowed = role === 'admin' || ((role === 'agent' || role === 'staff') && req.params.key === 'students');
+    const allowed = role === 'admin' || ((role === 'agent' || role === 'staff') && (req.params.key === 'students' || req.params.key === 'agent_logins'));
     if (!allowed) return res.status(401).json({ error: 'Is data ko badalne ke liye sahi login/permission zaroori hai.' });
     kvSet('kv_admin_entities', req.params.key, req.body, res);
 });
@@ -1215,23 +1311,639 @@ app.get('/api/blob/:key', (req, res) => {
     if (!BLOB_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown blob key' });
     // 🔒 Secrets (Razorpay/SMS keys) aur internal HR/agent data sirf Admin
     // login ke saath hi padhe ja sakte hain — baaki (settings/notices etc.)
-    // public site ke liye pehle jaisa hi khula rehta hai.
+    // public site ke liye pehle jaisa hi khula rehta hai. Kuch keys
+    // (staff_att/leave_requests) Employee/Agent/Admin — teeno — padh sakte
+    // hain, kyunki HRMS self-service portal ko yeh chahiye.
     if (ADMIN_ONLY_READ_BLOB_KEYS.includes(req.params.key)) {
         const auth = getAuthUser(req);
         if (!auth || String(auth.role || '').toLowerCase() !== 'admin') {
             return res.status(401).json({ error: 'Is data ko dekhne ke liye Admin login zaroori hai.' });
         }
+    } else if (MULTI_ROLE_READ_BLOB_KEYS[req.params.key]) {
+        const auth = getAuthUser(req);
+        const allowedRoles = MULTI_ROLE_READ_BLOB_KEYS[req.params.key];
+        if (!auth || !allowedRoles.includes(String(auth.role || '').toLowerCase())) {
+            return res.status(401).json({ error: 'Is data ko dekhne ke liye sahi login zaroori hai.' });
+        }
     }
     kvGet('kv_blob', req.params.key, res);
 });
-app.post('/api/blob/:key', requireRole('admin'), (req, res) => {
+// 🔒 RBAC: 'staff_att'/'leave_requests' Employee/Agent bhi likh sakte hain
+// (apni attendance punch / leave apply karne ke liye) — baaki sab blob
+// keys sirf Admin likh sakta hai.
+app.post('/api/blob/:key', (req, res) => {
     if (!BLOB_KEYS.includes(req.params.key)) return res.status(404).json({ error: 'Unknown blob key' });
+    const auth = getAuthUser(req);
+    const role = auth && String(auth.role || '').toLowerCase();
+    const multiRoleAllowed = MULTI_ROLE_WRITE_BLOB_KEYS[req.params.key] && MULTI_ROLE_WRITE_BLOB_KEYS[req.params.key].includes(role);
+    if (role !== 'admin' && !multiRoleAllowed) {
+        return res.status(401).json({ error: 'Is data ko badalne ke liye sahi login/permission zaroori hai.' });
+    }
     kvSet('kv_blob', req.params.key, req.body, res);
 });
 app.delete('/api/blob/:key', requireRole('admin'), (req, res) => {
     db.query('DELETE FROM kv_blob WHERE `key` = ?', [req.params.key], (err) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
         res.json({ success: true });
+    });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 🧑‍💼 HRMS EMPLOYEE REGISTRATION + APPROVAL (Postgres-backed, Firebase
+//   ki jagah). Data 'kv_blob' mein 'hrms_pending_registrations' aur
+//   'hrms_employees' keys ke andar rehta hai (dono BLOB_KEYS mein hain).
+//   Naya employee: self-register (pending) → Admin ya us Agent (jiski
+//   Library select ki thi) approve/reject/edit kar sakta hai.
+// ══════════════════════════════════════════════════════════════════
+function hrGetBlob(key, cb) {
+    db.query('SELECT value FROM kv_blob WHERE `key` = ?', [key], (err, rows) => {
+        if (err) return cb(err);
+        let list = [];
+        try { list = JSON.parse(rows[0] && rows[0].value) || []; } catch (e) { list = []; }
+        cb(null, Array.isArray(list) ? list : []);
+    });
+}
+// 🔒 Kuch blobs ARRAY nahi, OBJECT hote hain (jaise selfies: {studentId: {...}},
+// student_photos: {studentId: photo}) — hrGetBlob hamesha [] array force
+// karta hai isliye unke liye yeh alag helper hai jo object hi rakhta hai.
+function hrGetBlobObj(key, cb) {
+    db.query('SELECT value FROM kv_blob WHERE `key` = ?', [key], (err, rows) => {
+        if (err) return cb(err);
+        let val = {};
+        try { val = JSON.parse(rows[0] && rows[0].value) || {}; } catch (e) { val = {}; }
+        cb(null, (val && typeof val === 'object' && !Array.isArray(val)) ? val : {});
+    });
+}
+function hrSetBlob(key, list, cb) {
+    db.query(
+        'INSERT INTO kv_blob ("key", value) VALUES (?, ?) ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value',
+        [key, JSON.stringify(list)],
+        cb
+    );
+}
+// Registration/approval par Admin ya SAHI Agent (jis Library ke liye
+// registration hui thi) hi permission rakhte hain — koi aur agent kisi
+// doosri library ki registration approve nahi kar sakta.
+function hrCanManage(auth, agentUsername) {
+    if (!auth) return false;
+    const role = String(auth.role || '').toLowerCase();
+    if (role === 'admin') return true;
+    if (role === 'agent' && auth.username && agentUsername && String(auth.username).toLowerCase() === String(agentUsername).toLowerCase()) return true;
+    return false;
+}
+
+// 1) Registration submit — PUBLIC (login se pehle hota hai). Admin login
+//    se call hone par agentUsername zaroori nahi (Admin Panel se global
+//    staff add karna — kisi specific library se linked nahi).
+app.post('/api/hr/register', (req, res) => {
+    const body = req.body || {};
+    const auth = getAuthUser(req);
+    const isAdminCall = auth && String(auth.role || '').toLowerCase() === 'admin';
+    const name = (body.name || '').trim();
+    const phone = (body.phone || '').trim();
+    const agentUsername = body.agentUsername || '';
+    if (!name) return res.status(400).json({ error: 'Naam daalna zaroori hai.' });
+    if (!/^\d{10}$/.test(phone)) return res.status(400).json({ error: 'Poora 10-digit mobile number daalein.' });
+    if (!agentUsername && !isAdminCall) return res.status(400).json({ error: 'Library/Agent chunna zaroori hai.' });
+    hrGetBlob('hrms_pending_registrations', (err, pending) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        hrGetBlob('hrms_employees', (err2, employees) => {
+            if (err2) return res.status(500).json({ error: 'DB error: ' + err2.message });
+            const dup = (n) => String(n || '').replace(/\D/g, '').slice(-10) === phone;
+            if (employees.some(e => dup(e.phone)) || pending.some(p => dup(p.phone))) {
+                return res.status(409).json({ error: 'Yeh mobile number pehle se kisi aur registration ke saath maujood hai.' });
+            }
+            const regId = 'PREG' + Date.now() + Math.random().toString(36).slice(2, 6);
+            const rec = {
+                id: regId, name, phone, email: body.email || '', address: body.address || '',
+                photo: body.photo || '', designation: body.designation || '', department: body.department || '',
+                agentUsername, status: 'pending', submittedOn: new Date().toISOString()
+            };
+            pending.push(rec);
+            hrSetBlob('hrms_pending_registrations', pending, (sErr) => {
+                if (sErr) return res.status(500).json({ error: 'DB error: ' + sErr.message });
+                res.status(201).json({ success: true, id: regId });
+            });
+        });
+    });
+});
+
+// 2) Pending registrations list — Admin ya Agent (sirf apni library ki
+//    registrations dikhti hain agent ko; Admin sab dekh sakta hai)
+app.get('/api/hr/registrations', (req, res) => {
+    const auth = getAuthUser(req);
+    const role = auth && String(auth.role || '').toLowerCase();
+    if (!auth || (role !== 'admin' && role !== 'agent')) {
+        return res.status(401).json({ error: 'Login zaroori hai.' });
+    }
+    hrGetBlob('hrms_pending_registrations', (err, pending) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        const list = role === 'admin' ? pending : pending.filter(p => String(p.agentUsername || '').toLowerCase() === String(auth.username).toLowerCase());
+        res.json(list);
+    });
+});
+
+// 3) Edit a pending registration (Admin/owning-Agent only)
+app.put('/api/hr/registrations/:id', (req, res) => {
+    const auth = getAuthUser(req);
+    hrGetBlob('hrms_pending_registrations', (err, pending) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        const idx = pending.findIndex(p => p.id === req.params.id);
+        if (idx < 0) return res.status(404).json({ error: 'Registration nahi mili.' });
+        if (!hrCanManage(auth, pending[idx].agentUsername)) return res.status(401).json({ error: 'Is registration ko edit karne ki permission nahi hai.' });
+        pending[idx] = Object.assign({}, pending[idx], req.body || {}, { id: pending[idx].id, agentUsername: pending[idx].agentUsername });
+        hrSetBlob('hrms_pending_registrations', pending, (sErr) => {
+            if (sErr) return res.status(500).json({ error: 'DB error: ' + sErr.message });
+            res.json({ success: true });
+        });
+    });
+});
+
+// 4) Approve — Admin/owning-Agent only. Naya Employee ID banata hai
+//    (EMP001, EMP002, ...), 'hrms_employees' mein daalta hai, pending se
+//    hataata hai.
+app.post('/api/hr/registrations/:id/approve', (req, res) => {
+    const auth = getAuthUser(req);
+    hrGetBlob('hrms_pending_registrations', (err, pending) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        const idx = pending.findIndex(p => p.id === req.params.id);
+        if (idx < 0) return res.status(404).json({ error: 'Registration nahi mili.' });
+        const reg = pending[idx];
+        if (!hrCanManage(auth, reg.agentUsername)) return res.status(401).json({ error: 'Is registration ko approve karne ki permission nahi hai.' });
+        // 🆕 Admin approve karte waqt agent/library CONFIRM ya BADAL sakta hai
+        // (jaise registration mein agent na chuna gaya ho, ya galat ho) —
+        // sirf Admin ko yeh override allowed hai, Agent apna hi agentUsername
+        // use karta hai.
+        const isAdmin = String(auth.role || '').toLowerCase() === 'admin';
+        const finalAgentUsername = (isAdmin && req.body && req.body.agentUsername) ? req.body.agentUsername : reg.agentUsername;
+        hrGetBlob('hrms_employees', (err2, employees) => {
+            if (err2) return res.status(500).json({ error: 'DB error: ' + err2.message });
+            let max = 0;
+            employees.forEach(e => { const n = parseInt(String(e.empId || '').replace('EMP', ''), 10) || 0; if (n > max) max = n; });
+            const empId = 'EMP' + String(max + 1).padStart(3, '0');
+            const newEmp = {
+                empId, name: reg.name, phone: reg.phone, email: reg.email || '', address: reg.address || '',
+                photo: reg.photo || '', designation: reg.designation || '', department: reg.department || '',
+                agentUsername: finalAgentUsername, ownerUser: finalAgentUsername, status: 'active', joinedOn: new Date().toISOString()
+            };
+            employees.push(newEmp);
+            pending.splice(idx, 1);
+            hrSetBlob('hrms_employees', employees, (sErr) => {
+                if (sErr) return res.status(500).json({ error: 'DB error: ' + sErr.message });
+                hrSetBlob('hrms_pending_registrations', pending, (sErr2) => {
+                    if (sErr2) return res.status(500).json({ error: 'DB error: ' + sErr2.message });
+                    res.json({ success: true, empId });
+                });
+            });
+        });
+    });
+});
+
+// 5) Reject — Admin/owning-Agent only
+app.post('/api/hr/registrations/:id/reject', (req, res) => {
+    const auth = getAuthUser(req);
+    hrGetBlob('hrms_pending_registrations', (err, pending) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        const idx = pending.findIndex(p => p.id === req.params.id);
+        if (idx < 0) return res.status(404).json({ error: 'Registration nahi mili.' });
+        if (!hrCanManage(auth, pending[idx].agentUsername)) return res.status(401).json({ error: 'Is registration ko reject karne ki permission nahi hai.' });
+        pending.splice(idx, 1);
+        hrSetBlob('hrms_pending_registrations', pending, (sErr) => {
+            if (sErr) return res.status(500).json({ error: 'DB error: ' + sErr.message });
+            res.json({ success: true });
+        });
+    });
+});
+
+// 6) Employee apni profile (photo/email/address/bank details) khud update
+//    kar sakta hai — sirf apna record, JWT se verified empId se. Agent/Admin
+//    bhi update kar sakte hain (jaise Basic Salary fix karna Agent Login ke
+//    HR Panel se) — Agent sirf apne agentUsername wale employees ke liye.
+app.put('/api/hr/employees/:empId', requireRole('employee', 'agent', 'admin'), (req, res) => {
+    const auth = req.authUser;
+    const role = String(auth.role || '').toLowerCase();
+    if (role === 'employee' && String(auth.username).toUpperCase() !== String(req.params.empId).toUpperCase()) {
+        return res.status(401).json({ error: 'Sirf apni khud ki profile update kar sakte hain.' });
+    }
+    hrGetBlob('hrms_employees', (err, employees) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        const idx = employees.findIndex(e => String(e.empId || '').toUpperCase() === String(req.params.empId).toUpperCase());
+        if (idx < 0) {
+            // 🔒 UPSERT: Admin Panel ke 'staff' entity wale employees frontend par
+            // 'hrms_employees' ke saath sirf MERGE hote hain (asal blob mein nahi
+            // hote) — jab agent pehli baar unki Basic Salary set kare, to yahan
+            // naya record ban jaata hai (jaisa Firebase .set() bhi karta tha).
+            const ownerField = (req.body && (req.body.agentUsername || req.body.ownerUser)) || '';
+            if (role === 'agent' && ownerField && String(ownerField).toLowerCase() !== String(auth.username).toLowerCase()) {
+                return res.status(401).json({ error: 'Sirf apni library ke employees update kar sakte hain.' });
+            }
+            const newEmp = Object.assign({ empId: req.params.empId, status: 'active' }, req.body || {}, { empId: req.params.empId });
+            employees.push(newEmp);
+            return hrSetBlob('hrms_employees', employees, (sErr) => {
+                if (sErr) return res.status(500).json({ error: 'DB error: ' + sErr.message });
+                res.json({ success: true, created: true });
+            });
+        }
+        const existingOwner = employees[idx].agentUsername || employees[idx].ownerUser;
+        if (role === 'agent' && existingOwner && String(existingOwner).toLowerCase() !== String(auth.username).toLowerCase()) {
+            return res.status(401).json({ error: 'Sirf apni library ke employees update kar sakte hain.' });
+        }
+        employees[idx] = Object.assign({}, employees[idx], req.body || {}, { empId: employees[idx].empId });
+        hrSetBlob('hrms_employees', employees, (sErr) => {
+            if (sErr) return res.status(500).json({ error: 'DB error: ' + sErr.message });
+            res.json({ success: true });
+        });
+    });
+});
+
+// 7) HRMS ke transactions/dashboard REST reads — pehle Firebase real-time
+//    listeners (watchPendingTransactions/watchAdminDashboard) use hote the,
+//    jo asal mein STALE the (writes bahut pehle hi is naye /api/payments/
+//    route par shift ho chuki thi, status bhi 'pending'/'verified' hai,
+//    Firebase wale purane 'Pending_HRMS' status se kabhi match hi nahi
+//    hota tha). Ab seedha isi Postgres 'transactions' table se REST GET.
+app.get('/api/hr/pending-transactions', (req, res) => {
+    const auth = getAuthUser(req);
+    const role = auth && String(auth.role || '').toLowerCase();
+    if (!auth || !['admin', 'agent', 'employee'].includes(role)) return res.status(401).json({ error: 'Login zaroori hai.' });
+    db.query("SELECT * FROM transactions WHERE status='pending' ORDER BY created_at DESC", (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json((rows || []).map(r => {
+            let extra = {};
+            try { extra = JSON.parse(r.data); } catch (e) {}
+            return Object.assign(extra, { id: r.id, agentId: r.agentId, studentId: r.studentId, amount: Number(r.amount), status: r.status, created_at: r.created_at });
+        }));
+    });
+});
+app.get('/api/hr/admin-dashboard', requireRole('admin'), (req, res) => {
+    db.query("SELECT * FROM transactions WHERE status='verified' ORDER BY created_at DESC LIMIT 200", (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        const ledger = (rows || []).map(r => ({ txnId: r.id, agentId: r.agentId, amount: Number(r.amount), verifiedAt: r.created_at }));
+        const totalCommission = ledger.reduce((s, x) => s + x.amount, 0);
+        res.json({ totalCommission, ledger });
+    });
+});
+
+// 🔒 SAFE "Factory Reset" — sirf ISI Agent ke apne data (students, attendance,
+// fee records, members, pending_staff, salary_claims — jahan bhi 'ownerUser'/
+// 'agentId'/'agentUsername' match kare) ko hataata hai. Firebase-era wala
+// purana button POORE 'shdl' root ko delete kar deta tha — matlab EK agent
+// dabaye to SAARE agents ka data (baaki libraries samet) mit jaata — ek
+// khatarnak cross-tenant bug jo yahan fix kiya gaya hai. Yeh naya route
+// sirf apna hi data delete karta hai.
+app.post('/api/agent/factory-reset', requireRole('agent'), (req, res) => {
+    const agentUser = String(req.authUser.username || '').toLowerCase();
+    if (!agentUser) return res.status(400).json({ error: 'Agent identity nahi mili.' });
+
+    function filterOutOwn(list, cb) {
+        const kept = (list || []).filter(r => r && String(r.ownerUser || r.agentId || r.agentUsername || '').toLowerCase() !== agentUser);
+        cb(kept);
+    }
+    const tasks = ['students', 'att_records', 'fee_records', 'members', 'pending_staff', 'salary_claims', 'agent_logins'];
+    let pending = tasks.length;
+    let hadError = false;
+    function done() { pending--; if (pending === 0) { if (hadError) return res.status(500).json({ error: 'Kuch data reset nahi ho paya, dobara try karein.' }); res.json({ success: true }); } }
+
+    tasks.forEach(key => {
+        const table = key === 'students' || key === 'agent_logins' ? 'kv_admin_entities' : 'kv_blob';
+        db.query(`SELECT value FROM ${table} WHERE \`key\` = ?`, [key], (err, rows) => {
+            if (err) { hadError = true; return done(); }
+            let list = [];
+            try { list = JSON.parse(rows[0] && rows[0].value) || []; } catch (e) { list = []; }
+            if (!Array.isArray(list)) return done(); // object-shaped blobs yahan skip (students/agent_logins/att_records/fee_records/members/pending_staff/salary_claims sab array hote hain)
+            filterOutOwn(list, (kept) => {
+                const toSave = table === 'kv_admin_entities' ? hashEntityPasswordsBeforeSave(kept) : kept;
+                db.query(
+                    `INSERT INTO ${table} ("key", value) VALUES (?, ?) ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value`,
+                    [key, JSON.stringify(toSave)],
+                    (sErr) => { if (sErr) hadError = true; done(); }
+                );
+            });
+        });
+    });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 💳 PFMS (Accountant) PORTAL — Agent payout request → HRMS/Staff
+//   approval → PFMS "Pay Now" (wallet debit + ledger entry).
+// ══════════════════════════════════════════════════════════════════
+
+// ── 1) ADMIN: PFMS login credentials CRUD (bcrypt-hashed, admin-only) ──
+app.get('/api/admin/pfms-users', requireRole('admin'), (req, res) => {
+    db.query('SELECT id, username, name, status, created_by_admin, created_at FROM pfms_users ORDER BY created_at DESC', (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json(rows || []); // 🔒 password_hash yahan kabhi select/return nahi hota
+    });
+});
+app.post('/api/admin/pfms-users', requireRole('admin'), (req, res) => {
+    const { username, name, password } = req.body || {};
+    if (!username || !password) return res.status(400).json({ error: 'username aur password zaroori hain.' });
+    if (password.length < 6) return res.status(400).json({ error: 'Password kam se kam 6 characters ka ho.' });
+    const hash = bcrypt.hashSync(password, 10);
+    db.query(
+        'INSERT INTO pfms_users (username, name, password_hash, created_by_admin) VALUES (?,?,?,?)',
+        [username, name || username, hash, req.authUser.username],
+        (err, result) => {
+            if (err) {
+                if (String(err.message || '').includes('duplicate') || String(err.code) === '23505') {
+                    return res.status(409).json({ error: 'Yeh username pehle se maujood hai.' });
+                }
+                return res.status(500).json({ error: 'DB error: ' + err.message });
+            }
+            res.status(201).json({ success: true, id: result.insertId });
+        }
+    );
+});
+app.put('/api/admin/pfms-users/:id', requireRole('admin'), (req, res) => {
+    const { name, password, status } = req.body || {};
+    const sets = [];
+    const params = [];
+    if (name !== undefined) { sets.push('name=?'); params.push(name); }
+    if (status !== undefined) { sets.push('status=?'); params.push(status); }
+    if (password) {
+        if (password.length < 6) return res.status(400).json({ error: 'Password kam se kam 6 characters ka ho.' });
+        sets.push('password_hash=?'); params.push(bcrypt.hashSync(password, 10));
+    }
+    if (!sets.length) return res.status(400).json({ error: 'Kuch bhi update karne ke liye nahi diya gaya.' });
+    params.push(req.params.id);
+    db.query(`UPDATE pfms_users SET ${sets.join(', ')} WHERE id=?`, params, (err) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json({ success: true });
+    });
+});
+app.delete('/api/admin/pfms-users/:id', requireRole('admin'), (req, res) => {
+    db.query('DELETE FROM pfms_users WHERE id=?', [req.params.id], (err) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json({ success: true });
+    });
+});
+
+// ── 2) AGENT: payout/expense request banaye ──
+app.post('/api/agent/payout-request', requireRole('agent'), (req, res) => {
+    const agentId = req.authUser.username;
+    const amount = Number((req.body || {}).amount);
+    const reason = (req.body || {}).reason || '';
+    if (!(amount > 0)) return res.status(400).json({ error: 'Sahi amount daalein.' });
+    db.query('SELECT value FROM kv_admin_entities WHERE `key`=?', ['agents'], (err, rows) => {
+        let agentName = agentId;
+        try {
+            const agents = JSON.parse(rows && rows[0] && rows[0].value) || [];
+            const a = agents.find(x => x && x.username === agentId);
+            if (a) agentName = a.company || a.name || agentId;
+        } catch (e) {}
+        const id = 'PR' + Date.now() + Math.random().toString(36).slice(2, 6);
+        db.query(
+            'INSERT INTO payout_requests (id, agentId, agentName, amount, reason, status) VALUES (?,?,?,?,?,?)',
+            [id, agentId, agentName, amount, reason, 'Pending'],
+            (iErr) => {
+                if (iErr) return res.status(500).json({ error: 'DB error: ' + iErr.message });
+                res.status(201).json({ success: true, id });
+            }
+        );
+    });
+});
+// Agent apni khud ki requests dekh sakta hai
+app.get('/api/agent/payout-requests', requireRole('agent'), (req, res) => {
+    db.query('SELECT * FROM payout_requests WHERE agentId=? ORDER BY created_at DESC', [req.authUser.username], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json(rows || []);
+    });
+});
+
+// ── 3) HRMS/Staff (role='employee'): pending requests verify + approve/reject ──
+app.get('/api/hr/payout-requests', requireRole('employee', 'admin'), (req, res) => {
+    db.query("SELECT * FROM payout_requests WHERE status='Pending' ORDER BY created_at ASC", (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json(rows || []);
+    });
+});
+app.post('/api/hr/payout-requests/:id/approve', requireRole('employee', 'admin'), (req, res) => {
+    db.query('SELECT * FROM payout_requests WHERE id=?', [req.params.id], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        const reqRow = rows && rows[0];
+        if (!reqRow) return res.status(404).json({ error: 'Request nahi mili.' });
+        if (reqRow.status !== 'Pending') return res.status(409).json({ error: 'Yeh request ab Pending nahi hai — kisi aur ne pehle process kar diya hai.' });
+        // 🔒 Agent ke current approved wallet balance se zyada payout approve
+        // nahi ho sakta — taaki PFMS "Pay Now" karte waqt balance kabhi
+        // negative na ho jaaye.
+        db.query('SELECT approved_balance FROM agent_wallets WHERE agentId=?', [reqRow.agentId], (wErr, wRows) => {
+            const bal = Number(wRows && wRows[0] && wRows[0].approved_balance) || 0;
+            if (Number(reqRow.amount) > bal) {
+                return res.status(400).json({ error: `Agent ka approved wallet balance (₹${bal}) is request ke amount (₹${reqRow.amount}) se kam hai — approve nahi kar sakte.` });
+            }
+            db.query(
+                "UPDATE payout_requests SET status='HR_Approved', hr_approved_by=?, hr_approved_at=CURRENT_TIMESTAMP WHERE id=?",
+                [req.authUser.username, req.params.id],
+                (uErr) => {
+                    if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
+                    res.json({ success: true });
+                }
+            );
+        });
+    });
+});
+app.post('/api/hr/payout-requests/:id/reject', requireRole('employee', 'admin'), (req, res) => {
+    const reason = (req.body || {}).reason || '';
+    db.query('SELECT status FROM payout_requests WHERE id=?', [req.params.id], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        if (!rows || !rows[0]) return res.status(404).json({ error: 'Request nahi mili.' });
+        if (rows[0].status !== 'Pending') return res.status(409).json({ error: 'Yeh request ab Pending nahi hai.' });
+        db.query("UPDATE payout_requests SET status='Rejected', rejected_reason=? WHERE id=?", [reason, req.params.id], (uErr) => {
+            if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
+            res.json({ success: true });
+        });
+    });
+});
+
+// ── 4) PFMS: HR-approved list + "Pay Now" (wallet debit + ledger + status) ──
+app.get('/api/pfms/payout-requests', requireRole('pfms'), (req, res) => {
+    db.query("SELECT * FROM payout_requests WHERE status='HR_Approved' ORDER BY hr_approved_at ASC", (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json(rows || []);
+    });
+});
+app.get('/api/pfms/payout-requests/paid', requireRole('pfms', 'admin'), (req, res) => {
+    db.query("SELECT * FROM payout_requests WHERE status='Paid' ORDER BY pfms_paid_at DESC LIMIT 200", (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json(rows || []);
+    });
+});
+app.post('/api/pfms/payout-requests/:id/pay', requireRole('pfms'), (req, res) => {
+    db.query('SELECT * FROM payout_requests WHERE id=?', [req.params.id], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        const reqRow = rows && rows[0];
+        if (!reqRow) return res.status(404).json({ error: 'Request nahi mili.' });
+        // 🔒 IDEMPOTENCY: sirf 'HR_Approved' status wali request hi pay ho
+        // sakti hai — agar kisi doosre PFMS user ne (ya double-click se)
+        // ise pehle hi Paid kar diya ho, dobara deduct nahi hoga.
+        if (reqRow.status !== 'HR_Approved') {
+            return res.status(409).json({ error: 'Yeh request ab HR_Approved nahi hai — shayad already Paid ho chuki hai.' });
+        }
+        // Pehle status ko atomically 'HR_Approved' → 'Paid' karo (WHERE
+        // status='HR_Approved' guard ke saath) — race condition mein bhi
+        // sirf EK hi request successfully row-affect karegi.
+        db.query(
+            "UPDATE payout_requests SET status='Paid', pfms_paid_by=?, pfms_paid_at=CURRENT_TIMESTAMP WHERE id=? AND status='HR_Approved'",
+            [req.authUser.username, req.params.id],
+            (uErr, uResult) => {
+                if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
+                if (!uResult || !uResult.affectedRows) {
+                    return res.status(409).json({ error: 'Yeh request abhi-abhi kisi aur ne pay kar di — dobara refresh karein.' });
+                }
+                // a) Agent wallet se amount deduct karo
+                db.query(
+                    'UPDATE agent_wallets SET approved_balance = approved_balance - ? WHERE agentId=?',
+                    [reqRow.amount, reqRow.agentId],
+                    (wErr) => {
+                        if (wErr) console.warn('PFMS pay: wallet deduct error:', wErr.message);
+                        // b) Ledger mein DEBIT transaction entry banao (agent ke
+                        //    /api/agent/ledger mein turant dikhega)
+                        const txnId = 'TXN' + Date.now() + Math.random().toString(36).slice(2, 6);
+                        db.query(
+                            'INSERT INTO transactions (id, agentId, amount, status, reason, data) VALUES (?,?,?,?,?,?)',
+                            [txnId, reqRow.agentId, -Math.abs(Number(reqRow.amount)), 'verified', 'PFMS Payout: ' + (reqRow.reason || reqRow.id),
+                                JSON.stringify({ type: 'pfms_payout_debit', payoutRequestId: reqRow.id, paidBy: req.authUser.username })],
+                            (tErr) => {
+                                if (tErr) console.warn('PFMS pay: ledger entry error:', tErr.message);
+                                res.json({ success: true });
+                            }
+                        );
+                    }
+                );
+            }
+        );
+    });
+});
+
+// ── 5) AGENT: Live Ledger/Statement — collections + debits + running balance ──
+app.get('/api/agent/ledger', requireRole('agent'), (req, res) => {
+    const agentId = req.authUser.username;
+    db.query('SELECT * FROM transactions WHERE agentId=? ORDER BY created_at DESC LIMIT 500', [agentId], (err, txnRows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        db.query('SELECT * FROM agent_wallets WHERE agentId=?', [agentId], (wErr, wRows) => {
+            const wallet = (wRows && wRows[0]) || { approved_balance: 0, pending_balance: 0, total_earned: 0 };
+            const history = (txnRows || []).map(t => ({
+                id: t.id, amount: Number(t.amount), status: t.status, reason: t.reason,
+                type: Number(t.amount) < 0 ? 'debit' : 'credit', date: t.created_at
+            }));
+            const totalCollections = history.filter(h => h.type === 'credit').reduce((s, h) => s + h.amount, 0);
+            const totalDebits = history.filter(h => h.type === 'debit').reduce((s, h) => s + Math.abs(h.amount), 0);
+            res.json({
+                walletBalance: Number(wallet.approved_balance) || 0,
+                pendingBalance: Number(wallet.pending_balance) || 0,
+                totalEarned: Number(wallet.total_earned) || 0,
+                totalCollections, totalDebits,
+                history
+            });
+        });
+    });
+});
+
+// ── 6) ADMIN: PFMS Master Ledger — sab kuch ek jagah ──
+app.get('/api/admin/pfms-master-ledger', requireRole('admin'), (req, res) => {
+    db.query('SELECT * FROM transactions ORDER BY created_at DESC LIMIT 500', (e1, txns) => {
+        if (e1) return res.status(500).json({ error: 'DB error: ' + e1.message });
+        db.query('SELECT * FROM payout_requests ORDER BY created_at DESC LIMIT 500', (e2, payouts) => {
+            if (e2) return res.status(500).json({ error: 'DB error: ' + e2.message });
+            db.query('SELECT agentId, approved_balance, pending_balance, total_earned FROM agent_wallets', (e3, wallets) => {
+                if (e3) return res.status(500).json({ error: 'DB error: ' + e3.message });
+                res.json({
+                    transactions: (txns || []).map(t => ({ id: t.id, agentId: t.agentId, studentId: t.studentId, amount: Number(t.amount), status: t.status, reason: t.reason, date: t.created_at })),
+                    payoutRequests: payouts || [],
+                    agentWallets: wallets || []
+                });
+            });
+        });
+    });
+});
+
+// ══════════════════════════════════════════════════════════════════
+// 📸 STUDENT SELF-SERVICE ATTENDANCE (mobile selfie+GPS punch)
+//   Student apni attendance khud mark karta hai — 'att_records',
+//   'selfies', 'attendance_locations', 'student_photos' blobs sensitive
+//   (poore batch ka data) hain, isliye Student ko poori list GET karne
+//   ki zaroorat/permission nahi — yeh dedicated endpoints sirf server-
+//   side merge karte hain (student sirf apna record bhejta hai).
+// ══════════════════════════════════════════════════════════════════
+app.post('/api/attendance/mark', requireRole('student'), (req, res) => {
+    const entry = req.body || {};
+    if (!entry.date || !entry.batch) return res.status(400).json({ error: 'date aur batch zaroori hain.' });
+    hrGetBlob('att_records', (err, records) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        // Isi date+batch ka existing record ho to usi mein naye student ka
+        // record MERGE karo (jaisa client pehle localStorage mein karta tha)
+        // — poora din/batch overwrite nahi hota, sirf is student ki entry.
+        let idx = records.findIndex(r => r && r.date === entry.date && String(r.batch) === String(entry.batch));
+        if (idx < 0) {
+            records.push({ date: entry.date, batch: entry.batch, records: entry.records || {}, selfies: entry.selfies || {}, markedBy: entry.markedBy || req.authUser.username, savedAt: new Date().toLocaleTimeString() });
+        } else {
+            records[idx].records = Object.assign({}, records[idx].records, entry.records || {});
+            if (entry.selfies) records[idx].selfies = Object.assign({}, records[idx].selfies, entry.selfies);
+            records[idx].savedAt = new Date().toLocaleTimeString();
+        }
+        hrSetBlob('att_records', records, (sErr) => {
+            if (sErr) return res.status(500).json({ error: 'DB error: ' + sErr.message });
+            res.json({ success: true });
+        });
+    });
+});
+app.post('/api/attendance/selfie', requireRole('student'), (req, res) => {
+    const { studentId, date, selfie, location, name, batch } = req.body || {};
+    if (!studentId || !date) return res.status(400).json({ error: 'studentId aur date zaroori hain.' });
+    hrGetBlobObj('selfies', (err, store) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        store[studentId] = store[studentId] || {};
+        store[studentId][date] = {
+            selfie: selfie || '', name: name || '', batch: batch || '',
+            time: new Date().toLocaleTimeString('en-IN'), studentId,
+            lat: location ? location.lat : null, lng: location ? location.lng : null,
+            accuracy: location ? location.accuracy : null, mapsLink: location ? location.mapsLink : null,
+            locationAt: location ? location.capturedAt : null
+        };
+        hrSetBlob('selfies', store, (sErr) => {
+            if (sErr) return res.status(500).json({ error: 'DB error: ' + sErr.message });
+            // attendance_locations — alag, seedha GPS-only lookup
+            if (location) {
+                hrGetBlobObj('attendance_locations', (err2, locStore) => {
+                    locStore[studentId] = locStore[studentId] || {};
+                    locStore[studentId][date] = { lat: location.lat, lng: location.lng, accuracy: location.accuracy, mapsLink: location.mapsLink, name: name || '', batch: batch || '', time: new Date().toLocaleTimeString('en-IN'), capturedAt: location.capturedAt };
+                    hrSetBlob('attendance_locations', locStore, () => {});
+                });
+            }
+            // student_photos — profile photo bhi latest selfie se update
+            if (selfie) {
+                hrGetBlobObj('student_photos', (err3, photoStore) => {
+                    photoStore[studentId] = selfie;
+                    hrSetBlob('student_photos', photoStore, () => {});
+                });
+            }
+            res.json({ success: true });
+        });
+    });
+});
+app.put('/api/attendance/profile-photo/:studentId', requireRole('student'), (req, res) => {
+    const { photo } = req.body || {};
+    if (!photo) return res.status(400).json({ error: 'photo zaroori hai.' });
+    hrGetBlobObj('student_photos', (err, store) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        store[req.params.studentId] = photo;
+        hrSetBlob('student_photos', store, (sErr) => {
+            if (sErr) return res.status(500).json({ error: 'DB error: ' + sErr.message });
+            res.json({ success: true });
+        });
+    });
+});
+// Student apni khud ki profile photo / latest selfie dekh sakta hai
+// (poori list nahi, sirf apna record).
+app.get('/api/attendance/profile-photo/:studentId', (req, res) => {
+    const auth = getAuthUser(req);
+    const role = auth && String(auth.role || '').toLowerCase();
+    if (!auth || (role === 'student' && String(auth.username).toUpperCase() !== String(req.params.studentId).toUpperCase()) || (role !== 'student' && role !== 'admin' && role !== 'agent')) {
+        return res.status(401).json({ error: 'Permission nahi hai.' });
+    }
+    hrGetBlobObj('student_photos', (err, store) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json({ photo: store[req.params.studentId] || null });
     });
 });
 
