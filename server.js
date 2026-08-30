@@ -721,7 +721,18 @@ db.getConnection((err, connection) => {
         "ALTER TABLE material_bills ADD COLUMN IF NOT EXISTS ownerUserId VARCHAR(50) NOT NULL DEFAULT ''",
         "ALTER TABLE material_bills ADD COLUMN IF NOT EXISTS data TEXT",
         "ALTER TABLE material_bills ADD COLUMN IF NOT EXISTS savedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
-        "ALTER TABLE site_files ADD COLUMN IF NOT EXISTS slug VARCHAR(150) UNIQUE"
+        "ALTER TABLE site_files ADD COLUMN IF NOT EXISTS slug VARCHAR(150) UNIQUE",
+        // 🆕 PFMS ↔ HRMS LINKING: payout_requests ab sirf Agent-payouts tak
+        // seemit nahi — Employee ki Salary Slip bhi isi table se PFMS tak
+        // jaati hai (type='employee_salary'), taaki PFMS ek hi jagah se
+        // dono tarah ke payments process kar sake, bank details (jo
+        // 'hrms_employees' se aate hain) ke saath.
+        "ALTER TABLE payout_requests ADD COLUMN IF NOT EXISTS type VARCHAR(20) DEFAULT 'agent_payout'",
+        "ALTER TABLE payout_requests ADD COLUMN IF NOT EXISTS employeeId VARCHAR(50)",
+        "ALTER TABLE payout_requests ADD COLUMN IF NOT EXISTS salarySlipId VARCHAR(50)",
+        "ALTER TABLE payout_requests ADD COLUMN IF NOT EXISTS bankName VARCHAR(255)",
+        "ALTER TABLE payout_requests ADD COLUMN IF NOT EXISTS accountNo VARCHAR(50)",
+        "ALTER TABLE payout_requests ADD COLUMN IF NOT EXISTS ifsc VARCHAR(20)"
     ];
 
     // 🆕 'updated_at' column ko row update hote hi khud-ba-khud "abhi" set
@@ -1712,6 +1723,44 @@ app.post('/api/agent/payout-request', requireRole('agent'), (req, res) => {
         );
     });
 });
+
+// 🆕 HRMS ↔ PFMS LINK: Salary slip ke liye payment request banao — bank
+//   details ('hrms_employees' se) automatically attach ho jaate hain,
+//   taaki PFMS bina kisi extra lookup ke seedha pay kar sake. Yeh route
+//   HR Panel se (role: agent/employee/admin) call hoti hai jab "Verify &
+//   Mark Paid" dabaya jaata hai.
+app.post('/api/hr/salary-slips/:slipId/request-payment', requireRole('agent', 'employee', 'admin'), (req, res) => {
+    const { empId, empName, netAmount } = req.body || {};
+    const amount = Number(netAmount);
+    if (!empId || !(amount > 0)) return res.status(400).json({ error: 'empId aur sahi netAmount zaroori hain.' });
+    hrGetBlob('hrms_employees', (err, employees) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        const emp = employees.find(e => String(e.empId || '').toUpperCase() === String(empId).toUpperCase());
+        if (!emp) return res.status(404).json({ error: 'Employee record nahi mila.' });
+        if (!emp.bank || !emp.acc || !emp.ifsc) {
+            return res.status(400).json({ error: 'Employee ne abhi apni Bank Name, Account Number, IFSC "My Profile" mein save nahi ki hai — pehle wahi complete karayein.' });
+        }
+        const id = 'PR' + Date.now() + Math.random().toString(36).slice(2, 6);
+        db.query(
+            `INSERT INTO payout_requests
+             (id, agentId, agentName, amount, reason, status, type, employeeId, salarySlipId, bankName, accountNo, ifsc)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [id, emp.agentUsername || emp.ownerUser || '', empName || emp.name, amount,
+                'Salary payment', 'HR_Approved', 'employee_salary', empId, req.params.slipId,
+                emp.bank, emp.acc, emp.ifsc],
+            (iErr) => {
+                // 🔒 NOTE: HR khud verify karke bhej raha hai, isliye seedha
+                // 'HR_Approved' status se banti hai — alag se dobara approve
+                // karne ki zaroorat nahi (jaisa agent-payout flow mein hota
+                // hai). PFMS Portal isse turant "Pay Now" ke liye dekh
+                // paayega.
+                if (iErr) return res.status(500).json({ error: 'DB error: ' + iErr.message });
+                res.status(201).json({ success: true, id });
+            }
+        );
+    });
+});
+
 // Agent apni khud ki requests dekh sakta hai
 app.get('/api/agent/payout-requests', requireRole('agent'), (req, res) => {
     db.query('SELECT * FROM payout_requests WHERE agentId=? ORDER BY created_at DESC', [req.authUser.username], (err, rows) => {
@@ -1800,6 +1849,33 @@ app.post('/api/pfms/payout-requests/:id/pay', requireRole('pfms'), (req, res) =>
                 if (!uResult || !uResult.affectedRows) {
                     return res.status(409).json({ error: 'Yeh request abhi-abhi kisi aur ne pay kar di — dobara refresh karein.' });
                 }
+
+                // 🔗 TYPE-BASED SYNC: 'agent_payout' → agent ke wallet se
+                // deduct + ledger entry (jaisa pehle tha). 'employee_salary'
+                // → yeh institutional payroll hai, agent ke wallet se koi
+                // lena-dena nahi — seedha corresponding HRMS Salary Slip ko
+                // 'paid' mark karke Employee/HR Panel tak real-time sync
+                // karte hain.
+                if (reqRow.type === 'employee_salary') {
+                    hrGetBlob('hrms_salary_slips', (sErr, slips) => {
+                        if (sErr) { console.warn('PFMS pay: salary slip fetch error:', sErr.message); return res.json({ success: true }); }
+                        const idx = slips.findIndex(s => s && s.id === reqRow.salarySlipId);
+                        if (idx >= 0) {
+                            slips[idx].status = 'paid';
+                            slips[idx].verifiedBy = 'PFMS';
+                            slips[idx].verifiedById = req.authUser.username;
+                            slips[idx].paidAt = new Date().toISOString();
+                            hrSetBlob('hrms_salary_slips', slips, (sErr2) => {
+                                if (sErr2) console.warn('PFMS pay: salary slip update error:', sErr2.message);
+                                res.json({ success: true });
+                            });
+                        } else {
+                            res.json({ success: true }); // slip id na mile to bhi payment record 'Paid' rahega
+                        }
+                    });
+                    return;
+                }
+
                 // a) Agent wallet se amount deduct karo
                 db.query(
                     'UPDATE agent_wallets SET approved_balance = approved_balance - ? WHERE agentId=?',
@@ -1862,6 +1938,41 @@ app.get('/api/admin/pfms-master-ledger', requireRole('admin'), (req, res) => {
                     payoutRequests: payouts || [],
                     agentWallets: wallets || []
                 });
+            });
+        });
+    });
+});
+
+// 🆕 ADMIN: HR Report — sabhi HRMS employees (bank details samet) +
+//   unki latest salary slip + payout status, ek hi consolidated report
+//   mein. Employee jab bhi HRMS se koi claim/data submit kare, yeh
+//   report automatically usi turant reflect karti hai (koi caching nahi
+//   — har baar fresh DB read).
+app.get('/api/admin/hr-report', requireRole('admin'), (req, res) => {
+    hrGetBlob('hrms_employees', (e1, employees) => {
+        if (e1) return res.status(500).json({ error: 'DB error: ' + e1.message });
+        hrGetBlob('hrms_salary_slips', (e2, slips) => {
+            if (e2) return res.status(500).json({ error: 'DB error: ' + e2.message });
+            db.query("SELECT * FROM payout_requests WHERE type='employee_salary' ORDER BY created_at DESC", (e3, payouts) => {
+                if (e3) return res.status(500).json({ error: 'DB error: ' + e3.message });
+                const report = employees.map(emp => {
+                    const empSlips = (slips || []).filter(s => s && s.empId === emp.empId).sort((a, b) => (b.year - a.year) || (b.month - a.month));
+                    const latestSlip = empSlips[0] || null;
+                    const latestPayout = (payouts || []).find(p => p.employeeId === emp.empId) || null;
+                    return {
+                        empId: emp.empId, name: emp.name, phone: emp.phone,
+                        designation: emp.designation, department: emp.department,
+                        agentUsername: emp.agentUsername || emp.ownerUser || '',
+                        status: emp.status,
+                        bankName: emp.bank || '', accountNo: emp.acc || '', ifsc: emp.ifsc || '',
+                        bankDetailsComplete: !!(emp.bank && emp.acc && emp.ifsc),
+                        latestNetPay: latestSlip ? Number(latestSlip.net) : null,
+                        latestSlipMonth: latestSlip ? (latestSlip.month + '/' + latestSlip.year) : null,
+                        latestSlipStatus: latestSlip ? latestSlip.status : null,
+                        latestPayoutStatus: latestPayout ? latestPayout.status : null
+                    };
+                });
+                res.json(report);
             });
         });
     });
