@@ -69,7 +69,16 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-app.use(express.json({ limit: '25mb' }));
+app.use(express.json({
+    limit: '25mb',
+    // 🆕 RAZORPAYX WEBHOOK: signature verify karne ke liye raw (unparsed)
+    // body bytes chahiye hote hain — JSON.parse ke baad wo bytes exact
+    // waapas nahi milte (whitespace/key-order badal sakta hai), isliye
+    // yahan verify callback se raw Buffer bhi req.rawBody mein save kar
+    // lete hain. Baaki poore app par iska koi asar nahi — sirf ek extra
+    // Buffer reference save hota hai.
+    verify: (req, res, buf) => { req.rawBody = buf; }
+}));
 app.use(express.urlencoded({ limit: '25mb', extended: true }));
 app.use(express.static('.'));
 
@@ -732,7 +741,15 @@ db.getConnection((err, connection) => {
         "ALTER TABLE payout_requests ADD COLUMN IF NOT EXISTS salarySlipId VARCHAR(50)",
         "ALTER TABLE payout_requests ADD COLUMN IF NOT EXISTS bankName VARCHAR(255)",
         "ALTER TABLE payout_requests ADD COLUMN IF NOT EXISTS accountNo VARCHAR(50)",
-        "ALTER TABLE payout_requests ADD COLUMN IF NOT EXISTS ifsc VARCHAR(20)"
+        "ALTER TABLE payout_requests ADD COLUMN IF NOT EXISTS ifsc VARCHAR(20)",
+        // 🆕 RAZORPAYX LIVE PAYOUT INTEGRATION: automated bank-transfer +
+        // employee/agent split ke liye.
+        "ALTER TABLE payout_requests ADD COLUMN IF NOT EXISTS agentShareAmount DECIMAL(12,2) DEFAULT 0",
+        "ALTER TABLE payout_requests ADD COLUMN IF NOT EXISTS rzp_payout_id VARCHAR(100)",
+        "ALTER TABLE payout_requests ADD COLUMN IF NOT EXISTS rzp_payout_status VARCHAR(30)",
+        "ALTER TABLE payout_requests ADD COLUMN IF NOT EXISTS rzp_agent_payout_id VARCHAR(100)",
+        "ALTER TABLE payout_requests ADD COLUMN IF NOT EXISTS rzp_agent_payout_status VARCHAR(30)",
+        "ALTER TABLE payout_requests ADD COLUMN IF NOT EXISTS payout_error VARCHAR(500)"
     ];
 
     // 🆕 'updated_at' column ko row update hote hi khud-ba-khud "abhi" set
@@ -1730,8 +1747,9 @@ app.post('/api/agent/payout-request', requireRole('agent'), (req, res) => {
 //   HR Panel se (role: agent/employee/admin) call hoti hai jab "Verify &
 //   Mark Paid" dabaya jaata hai.
 app.post('/api/hr/salary-slips/:slipId/request-payment', requireRole('agent', 'employee', 'admin'), (req, res) => {
-    const { empId, empName, netAmount } = req.body || {};
+    const { empId, empName, netAmount, agentShareAmount } = req.body || {};
     const amount = Number(netAmount);
+    const agentShare = Number(agentShareAmount) || 0;
     if (!empId || !(amount > 0)) return res.status(400).json({ error: 'empId aur sahi netAmount zaroori hain.' });
     hrGetBlob('hrms_employees', (err, employees) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
@@ -1743,11 +1761,11 @@ app.post('/api/hr/salary-slips/:slipId/request-payment', requireRole('agent', 'e
         const id = 'PR' + Date.now() + Math.random().toString(36).slice(2, 6);
         db.query(
             `INSERT INTO payout_requests
-             (id, agentId, agentName, amount, reason, status, type, employeeId, salarySlipId, bankName, accountNo, ifsc)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+             (id, agentId, agentName, amount, reason, status, type, employeeId, salarySlipId, bankName, accountNo, ifsc, agentShareAmount)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
             [id, emp.agentUsername || emp.ownerUser || '', empName || emp.name, amount,
                 'Salary payment', 'HR_Approved', 'employee_salary', empId, req.params.slipId,
-                emp.bank, emp.acc, emp.ifsc],
+                emp.bank, emp.acc, emp.ifsc, agentShare],
             (iErr) => {
                 // 🔒 NOTE: HR khud verify karke bhej raha hai, isliye seedha
                 // 'HR_Approved' status se banti hai — alag se dobara approve
@@ -1821,10 +1839,49 @@ app.get('/api/pfms/payout-requests', requireRole('pfms'), (req, res) => {
         res.json(rows || []);
     });
 });
+// 🆕 Bank mein "Processing" (RazorpayX ne accept kar liya, par webhook se
+// final confirm abhi nahi aaya) — PFMS ko yeh alag se dikhna chahiye taaki
+// dubara "Pay Now" na dabaya jaaye.
+app.get('/api/pfms/payout-requests/processing', requireRole('pfms', 'admin'), (req, res) => {
+    db.query("SELECT * FROM payout_requests WHERE status='Processing' ORDER BY pfms_paid_at DESC", (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        res.json(rows || []);
+    });
+});
 app.get('/api/pfms/payout-requests/paid', requireRole('pfms', 'admin'), (req, res) => {
     db.query("SELECT * FROM payout_requests WHERE status='Paid' ORDER BY pfms_paid_at DESC LIMIT 200", (err, rows) => {
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
         res.json(rows || []);
+    });
+});
+// 🆕 MANUAL RECONCILIATION: agar webhook kisi wajah se miss/delay ho jaaye,
+// PFMS user is button se seedha RazorpayX se live status khinch sakta hai.
+app.get('/api/pfms/payout-requests/:id/check-status', requireRole('pfms', 'admin'), async (req, res) => {
+    if (!razorpayXConfigured()) return res.status(501).json({ error: 'RazorpayX configure nahi hai.' });
+    db.query('SELECT * FROM payout_requests WHERE id=?', [req.params.id], async (err, rows) => {
+        if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
+        const pr = rows && rows[0];
+        if (!pr || !pr.rzp_payout_id) return res.status(404).json({ error: 'Is request ke liye koi RazorpayX payout nahi mila.' });
+        try {
+            const live = await razorpayXRequest('GET', '/v1/payouts/' + pr.rzp_payout_id, null);
+            let agentLive = null;
+            if (pr.rzp_agent_payout_id) agentLive = await razorpayXRequest('GET', '/v1/payouts/' + pr.rzp_agent_payout_id, null);
+            const mainDone = live.status === 'processed';
+            const agentDone = agentLive ? agentLive.status === 'processed' : true;
+            let newStatus = pr.status;
+            if (live.status === 'failed' || live.status === 'reversed' || (agentLive && (agentLive.status === 'failed' || agentLive.status === 'reversed'))) {
+                newStatus = 'HR_Approved'; // retry ke liye
+            } else if (mainDone && agentDone) {
+                newStatus = 'Paid';
+            }
+            db.query(
+                'UPDATE payout_requests SET status=?, rzp_payout_status=?, rzp_agent_payout_status=? WHERE id=?',
+                [newStatus, live.status, agentLive ? agentLive.status : pr.rzp_agent_payout_status, pr.id],
+                () => res.json({ success: true, status: newStatus, rzpStatus: live.status })
+            );
+        } catch (e) {
+            res.status(502).json({ error: 'RazorpayX se status check karne mein error: ' + e.message });
+        }
     });
 });
 app.post('/api/pfms/payout-requests/:id/pay', requireRole('pfms'), (req, res) => {
@@ -1832,70 +1889,228 @@ app.post('/api/pfms/payout-requests/:id/pay', requireRole('pfms'), (req, res) =>
         if (err) return res.status(500).json({ error: 'DB error: ' + err.message });
         const reqRow = rows && rows[0];
         if (!reqRow) return res.status(404).json({ error: 'Request nahi mili.' });
-        // 🔒 IDEMPOTENCY: sirf 'HR_Approved' status wali request hi pay ho
-        // sakti hai — agar kisi doosre PFMS user ne (ya double-click se)
-        // ise pehle hi Paid kar diya ho, dobara deduct nahi hoga.
         if (reqRow.status !== 'HR_Approved') {
-            return res.status(409).json({ error: 'Yeh request ab HR_Approved nahi hai — shayad already Paid ho chuki hai.' });
+            return res.status(409).json({ error: 'Yeh request ab HR_Approved nahi hai — shayad already Paid/Processing ho chuki hai.' });
         }
-        // Pehle status ko atomically 'HR_Approved' → 'Paid' karo (WHERE
-        // status='HR_Approved' guard ke saath) — race condition mein bhi
-        // sirf EK hi request successfully row-affect karegi.
+
+        // 🔒 IDEMPOTENCY (Step 1 — DB-level): status ko atomically
+        // 'HR_Approved' → 'Processing' karo (WHERE status='HR_Approved'
+        // guard ke saath) — race condition (double-click / do PFMS users
+        // ek saath) mein bhi sirf EK hi request successfully row-affect
+        // karegi, aur sirf wahi Razorpay ko call karegi.
+        const nextStatus = razorpayXConfigured() ? 'Processing' : 'Paid';
         db.query(
-            "UPDATE payout_requests SET status='Paid', pfms_paid_by=?, pfms_paid_at=CURRENT_TIMESTAMP WHERE id=? AND status='HR_Approved'",
-            [req.authUser.username, req.params.id],
+            `UPDATE payout_requests SET status=?, pfms_paid_by=?, pfms_paid_at=CURRENT_TIMESTAMP WHERE id=? AND status='HR_Approved'`,
+            [nextStatus, req.authUser.username, req.params.id],
             (uErr, uResult) => {
                 if (uErr) return res.status(500).json({ error: 'DB error: ' + uErr.message });
                 if (!uResult || !uResult.affectedRows) {
                     return res.status(409).json({ error: 'Yeh request abhi-abhi kisi aur ne pay kar di — dobara refresh karein.' });
                 }
 
-                // 🔗 TYPE-BASED SYNC: 'agent_payout' → agent ke wallet se
-                // deduct + ledger entry (jaisa pehle tha). 'employee_salary'
-                // → yeh institutional payroll hai, agent ke wallet se koi
-                // lena-dena nahi — seedha corresponding HRMS Salary Slip ko
-                // 'paid' mark karke Employee/HR Panel tak real-time sync
-                // karte hain.
-                if (reqRow.type === 'employee_salary') {
-                    hrGetBlob('hrms_salary_slips', (sErr, slips) => {
-                        if (sErr) { console.warn('PFMS pay: salary slip fetch error:', sErr.message); return res.json({ success: true }); }
-                        const idx = slips.findIndex(s => s && s.id === reqRow.salarySlipId);
-                        if (idx >= 0) {
-                            slips[idx].status = 'paid';
-                            slips[idx].verifiedBy = 'PFMS';
-                            slips[idx].verifiedById = req.authUser.username;
-                            slips[idx].paidAt = new Date().toISOString();
-                            hrSetBlob('hrms_salary_slips', slips, (sErr2) => {
-                                if (sErr2) console.warn('PFMS pay: salary slip update error:', sErr2.message);
-                                res.json({ success: true });
-                            });
-                        } else {
-                            res.json({ success: true }); // slip id na mile to bhi payment record 'Paid' rahega
-                        }
-                    });
-                    return;
+                // ══ FALLBACK PATH: RazorpayX configure nahi hai ══
+                // (RAZORPAYX_KEY_ID/SECRET/ACCOUNT_NUMBER Render Environment
+                // mein set nahi kiye gaye) — purana instant "mark Paid"
+                // behavior (koi real bank transfer nahi, sirf app ke andar
+                // record). Isse app hamesha kaam karta rehta hai, chahe
+                // live payouts abhi setup na hue hon.
+                if (!razorpayXConfigured()) {
+                    return _pfmsFinalizePaidLegacy(reqRow, req.authUser.username, res);
                 }
 
-                // a) Agent wallet se amount deduct karo
-                db.query(
-                    'UPDATE agent_wallets SET approved_balance = approved_balance - ? WHERE agentId=?',
-                    [reqRow.amount, reqRow.agentId],
-                    (wErr) => {
-                        if (wErr) console.warn('PFMS pay: wallet deduct error:', wErr.message);
-                        // b) Ledger mein DEBIT transaction entry banao (agent ke
-                        //    /api/agent/ledger mein turant dikhega)
-                        const txnId = 'TXN' + Date.now() + Math.random().toString(36).slice(2, 6);
-                        db.query(
-                            'INSERT INTO transactions (id, agentId, amount, status, reason, data) VALUES (?,?,?,?,?,?)',
-                            [txnId, reqRow.agentId, -Math.abs(Number(reqRow.amount)), 'verified', 'PFMS Payout: ' + (reqRow.reason || reqRow.id),
-                                JSON.stringify({ type: 'pfms_payout_debit', payoutRequestId: reqRow.id, paidBy: req.authUser.username })],
-                            (tErr) => {
-                                if (tErr) console.warn('PFMS pay: ledger entry error:', tErr.message);
-                                res.json({ success: true });
+                // ══ LIVE PATH: RazorpayX se asli bank transfer ══
+                _pfmsInitiateRazorpayXPayout(reqRow, req.authUser.username, res);
+            }
+        );
+    });
+});
+
+// Purana (RazorpayX na ho to) instant-paid path — wallet deduct + ledger /
+// salary-slip update, jaisa pehle tha.
+function _pfmsFinalizePaidLegacy(reqRow, pfmsUsername, res) {
+    if (reqRow.type === 'employee_salary') {
+        hrGetBlob('hrms_salary_slips', (sErr, slips) => {
+            if (sErr) { console.warn('PFMS pay: salary slip fetch error:', sErr.message); return res.json({ success: true }); }
+            const idx = slips.findIndex(s => s && s.id === reqRow.salarySlipId);
+            if (idx >= 0) {
+                slips[idx].status = 'paid';
+                slips[idx].verifiedBy = 'PFMS';
+                slips[idx].verifiedById = pfmsUsername;
+                slips[idx].paidAt = new Date().toISOString();
+                hrSetBlob('hrms_salary_slips', slips, (sErr2) => {
+                    if (sErr2) console.warn('PFMS pay: salary slip update error:', sErr2.message);
+                    res.json({ success: true });
+                });
+            } else {
+                res.json({ success: true });
+            }
+        });
+        return;
+    }
+    db.query('UPDATE agent_wallets SET approved_balance = approved_balance - ? WHERE agentId=?', [reqRow.amount, reqRow.agentId], (wErr) => {
+        if (wErr) console.warn('PFMS pay: wallet deduct error:', wErr.message);
+        const txnId = 'TXN' + Date.now() + Math.random().toString(36).slice(2, 6);
+        db.query(
+            'INSERT INTO transactions (id, agentId, amount, status, reason, data) VALUES (?,?,?,?,?,?)',
+            [txnId, reqRow.agentId, -Math.abs(Number(reqRow.amount)), 'verified', 'PFMS Payout: ' + (reqRow.reason || reqRow.id),
+                JSON.stringify({ type: 'pfms_payout_debit', payoutRequestId: reqRow.id, paidBy: pfmsUsername })],
+            (tErr) => {
+                if (tErr) console.warn('PFMS pay: ledger entry error:', tErr.message);
+                res.json({ success: true });
+            }
+        );
+    });
+}
+
+// 🆕 LIVE PATH: RazorpayX Contact → Fund Account → Payout banata hai.
+// Employee ko net-pay bhejta hai, aur agar agentShareAmount > 0 ho to
+// agent ko bhi ek alag payout se uska split bhejta hai. Yahan status
+// sirf 'Processing' set hota hai — FINAL 'Paid'/'Failed' status
+// webhook (/api/webhooks/razorpayx) se aata hai, jab bank transfer
+// asal mein confirm/fail ho jaaye.
+async function _pfmsInitiateRazorpayXPayout(reqRow, pfmsUsername, res) {
+    try {
+        if (reqRow.type === 'employee_salary') {
+            const employees = await new Promise((resolve, reject) => hrGetBlob('hrms_employees', (e, l) => e ? reject(e) : resolve(l)));
+            const idx = employees.findIndex(e => e && String(e.empId).toUpperCase() === String(reqRow.employeeId).toUpperCase());
+            if (idx < 0) throw new Error('Employee record nahi mila.');
+            const emp = employees[idx];
+            if (!emp.bank || !emp.acc || !emp.ifsc) throw new Error('Employee ki bank details poori nahi hain.');
+
+            const fundAccountId = await ensureRazorpayFundAccount(emp.rzpFundAccountId, emp.name, 'employee', emp.bank, emp.acc, emp.ifsc);
+            if (!emp.rzpFundAccountId) {
+                employees[idx].rzpFundAccountId = fundAccountId;
+                await new Promise((resolve) => hrSetBlob('hrms_employees', employees, () => resolve()));
+            }
+            const payout = await createRazorpayPayout(fundAccountId, reqRow.amount, reqRow.id, 'Salary - ' + reqRow.employeeId);
+
+            let agentPayoutId = null;
+            if (Number(reqRow.agentShareAmount) > 0 && reqRow.agentId) {
+                agentPayoutId = await _payAgentShare(reqRow.agentId, reqRow.agentShareAmount, reqRow.id + '_AGT');
+            }
+            db.query(
+                'UPDATE payout_requests SET rzp_payout_id=?, rzp_payout_status=?, rzp_agent_payout_id=? WHERE id=?',
+                [payout.id, payout.status || 'queued', agentPayoutId, reqRow.id],
+                () => res.json({ success: true, status: 'Processing', rzpPayoutId: payout.id })
+            );
+        } else {
+            // agent_payout — poora amount seedha agent ke bank account mein
+            const agentPayoutId = await _payAgentShare(reqRow.agentId, reqRow.amount, reqRow.id);
+            // Internal ledger bhi turant update (bookkeeping) — asli status
+            // baad mein webhook se 'Paid'/'Failed' confirm hoga.
+            db.query('UPDATE agent_wallets SET approved_balance = approved_balance - ? WHERE agentId=?', [reqRow.amount, reqRow.agentId], () => {});
+            const txnId = 'TXN' + Date.now() + Math.random().toString(36).slice(2, 6);
+            db.query(
+                'INSERT INTO transactions (id, agentId, amount, status, reason, data) VALUES (?,?,?,?,?,?)',
+                [txnId, reqRow.agentId, -Math.abs(Number(reqRow.amount)), 'pending', 'PFMS Payout (Razorpay processing): ' + (reqRow.reason || reqRow.id),
+                    JSON.stringify({ type: 'pfms_payout_debit', payoutRequestId: reqRow.id, paidBy: pfmsUsername })]
+            );
+            db.query(
+                'UPDATE payout_requests SET rzp_payout_id=? WHERE id=?',
+                [agentPayoutId, reqRow.id],
+                () => res.json({ success: true, status: 'Processing', rzpPayoutId: agentPayoutId })
+            );
+        }
+    } catch (e) {
+        // 🔒 ROLLBACK: Razorpay call fail hui (galat bank details, kam
+        // balance, API error) — status wapas 'HR_Approved' par le aate
+        // hain taaki PFMS user dobara try kar sake, data/permission fix
+        // karke.
+        console.error('RazorpayX payout error:', e.message);
+        db.query(
+            "UPDATE payout_requests SET status='HR_Approved', payout_error=? WHERE id=?",
+            [e.message, reqRow.id],
+            () => res.status(502).json({ error: 'RazorpayX payout fail ho gaya: ' + e.message + ' — request wapas HR_Approved kar di gayi hai, dobara try karein.' })
+        );
+    }
+}
+async function _payAgentShare(agentId, amountRupees, referenceId) {
+    const rows = await new Promise((resolve, reject) => db.query('SELECT value FROM kv_admin_entities WHERE `key`=?', ['agents'], (e, r) => e ? reject(e) : resolve(r)));
+    let agents = [];
+    try { agents = JSON.parse(rows[0] && rows[0].value) || []; } catch (e) {}
+    const idx = agents.findIndex(a => a && a.username === agentId);
+    if (idx < 0) throw new Error('Agent record nahi mila.');
+    const agent = agents[idx];
+    if (!agent.bank || !agent.ifsc) throw new Error('Agent ki bank details (Account Number/IFSC) poori nahi hain.');
+    const fundAccountId = await ensureRazorpayFundAccount(agent.rzpFundAccountId, agent.accountName || agent.company || agent.name, 'vendor', agent.bankName, agent.bank, agent.ifsc);
+    if (!agent.rzpFundAccountId) {
+        agents[idx].rzpFundAccountId = fundAccountId;
+        await new Promise((resolve) => db.query(
+            'INSERT INTO kv_admin_entities ("key", value) VALUES (?, ?) ON CONFLICT ("key") DO UPDATE SET value = EXCLUDED.value',
+            ['agents', JSON.stringify(agents)], () => resolve()
+        ));
+    }
+    const payout = await createRazorpayPayout(fundAccountId, amountRupees, referenceId, 'Agent payout - ' + agentId);
+    return payout.id;
+}
+
+// 🆕 RAZORPAYX WEBHOOK — bank transfer ka ASLI, final status yahan se
+//   aata hai (payout.processed / payout.failed / payout.reversed).
+//   Signature verify karna ZAROORI hai — warna koi bhi bina auth ke
+//   fake "payment successful" bhej kar payslip/wallet ko galat tarike
+//   se "Paid" mark karva sakta tha.
+app.post('/api/webhooks/razorpayx', (req, res) => {
+    const secret = process.env.RAZORPAYX_WEBHOOK_SECRET;
+    if (!secret) { console.warn('Webhook received but RAZORPAYX_WEBHOOK_SECRET not set — ignoring.'); return res.status(501).end(); }
+    const signature = req.headers['x-razorpay-signature'];
+    const expected = crypto.createHmac('sha256', secret).update(req.rawBody || Buffer.from(JSON.stringify(req.body))).digest('hex');
+    if (!signature || signature !== expected) {
+        console.warn('RazorpayX webhook: invalid signature — request ignored.');
+        return res.status(400).json({ error: 'Invalid signature' });
+    }
+
+    const event = req.body.event;
+    const payoutEntity = req.body.payload && req.body.payload.payout && req.body.payload.payout.entity;
+    if (!payoutEntity) return res.status(200).end(); // koi payout data nahi — kuch karne ki zaroorat nahi
+
+    const rzpPayoutId = payoutEntity.id;
+    const rzpStatus = payoutEntity.status; // 'processed' | 'failed' | 'reversed' | 'queued' etc.
+
+    db.query('SELECT * FROM payout_requests WHERE rzp_payout_id=? OR rzp_agent_payout_id=?', [rzpPayoutId, rzpPayoutId], (err, rows) => {
+        if (err || !rows || !rows[0]) return res.status(200).end(); // is app se related nahi — ignore
+        const pr = rows[0];
+        const isAgentLeg = pr.rzp_agent_payout_id === rzpPayoutId;
+
+        db.query(
+            isAgentLeg ? 'UPDATE payout_requests SET rzp_agent_payout_status=? WHERE id=?' : 'UPDATE payout_requests SET rzp_payout_status=? WHERE id=?',
+            [rzpStatus, pr.id],
+            () => {
+                if (event === 'payout.processed') {
+                    // Dono legs (agar agent-split bhi tha) processed hue tabhi
+                    // final 'Paid' mark karo — warna abhi partial hai.
+                    const mainDone = isAgentLeg ? pr.rzp_payout_status === 'processed' : true;
+                    const agentDone = pr.rzp_agent_payout_id ? (isAgentLeg ? true : pr.rzp_agent_payout_status === 'processed') : true;
+                    if (mainDone && agentDone) {
+                        db.query("UPDATE payout_requests SET status='Paid' WHERE id=?", [pr.id], () => {
+                            if (pr.type === 'employee_salary') {
+                                hrGetBlob('hrms_salary_slips', (sErr, slips) => {
+                                    if (sErr) return;
+                                    const idx = slips.findIndex(s => s && s.id === pr.salarySlipId);
+                                    if (idx >= 0) {
+                                        slips[idx].status = 'paid';
+                                        slips[idx].verifiedBy = 'PFMS (RazorpayX)';
+                                        slips[idx].paidAt = new Date().toISOString();
+                                        hrSetBlob('hrms_salary_slips', slips, () => {});
+                                    }
+                                });
+                            } else {
+                                db.query("UPDATE transactions SET status='verified' WHERE data::text LIKE ?", ['%"payoutRequestId":"' + pr.id + '"%'], () => {});
                             }
-                        );
+                        });
                     }
-                );
+                } else if (event === 'payout.failed' || event === 'payout.reversed') {
+                    // 🔒 Bank transfer fail/reverse hua — request ko wapas
+                    // HR_Approved kar dete hain (PFMS dobara try kar sake),
+                    // aur agar agent_payout tha to wallet/ledger bhi wapas
+                    // rollback karte hain (jo deduct kiya tha).
+                    db.query("UPDATE payout_requests SET status='HR_Approved', payout_error=? WHERE id=?",
+                        ['RazorpayX: ' + event + ' — ' + (payoutEntity.failure_reason || 'reason not given')], [pr.id], () => {});
+                    if (pr.type !== 'employee_salary' && !isAgentLeg) {
+                        db.query('UPDATE agent_wallets SET approved_balance = approved_balance + ? WHERE agentId=?', [pr.amount, pr.agentId], () => {});
+                        db.query("UPDATE transactions SET status='rejected' WHERE data::text LIKE ?", ['%"payoutRequestId":"' + pr.id + '"%'], () => {});
+                    }
+                }
+                res.status(200).end();
             }
         );
     });
@@ -2511,6 +2726,85 @@ function razorpayRequest(path, body) {
         reqStream.on('error', reject);
         reqStream.write(payload);
         reqStream.end();
+
+    });
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 💸 RAZORPAYX PAYOUTS — Live automated bank-transfer integration
+//   (Employee salary + Agent-share split, seedha bank account mein).
+//   YEH RAZORPAY CHECKOUT/ORDERS SE ALAG HAI — RazorpayX ek current
+//   account + payouts product hai, jiske liye Razorpay Dashboard se
+//   ALAG API keys aur ek funded "source" account chahiye hota hai.
+//   Render Environment mein set karein:
+//     RAZORPAYX_KEY_ID, RAZORPAYX_KEY_SECRET, RAZORPAYX_ACCOUNT_NUMBER
+//     RAZORPAYX_WEBHOOK_SECRET (webhook signature verify ke liye)
+// ══════════════════════════════════════════════════════════════════
+function razorpayXConfigured() {
+    return !!(process.env.RAZORPAYX_KEY_ID && process.env.RAZORPAYX_KEY_SECRET && process.env.RAZORPAYX_ACCOUNT_NUMBER);
+}
+function razorpayXRequest(method, path, body) {
+    return new Promise((resolve, reject) => {
+        const key = process.env.RAZORPAYX_KEY_ID;
+        const secret = process.env.RAZORPAYX_KEY_SECRET;
+        if (!key || !secret) return reject(new Error('RAZORPAYX_KEY_ID / RAZORPAYX_KEY_SECRET Render Environment mein set nahi hain.'));
+        const payload = body ? JSON.stringify(body) : '';
+        const options = {
+            hostname: 'api.razorpay.com',
+            path,
+            method,
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Basic ' + Buffer.from(key + ':' + secret).toString('base64')
+            }
+        };
+        if (payload) options.headers['Content-Length'] = Buffer.byteLength(payload);
+        const reqStream = https.request(options, (resp) => {
+            let data = '';
+            resp.on('data', (chunk) => { data += chunk; });
+            resp.on('end', () => {
+                try {
+                    const parsed = data ? JSON.parse(data) : {};
+                    if (resp.statusCode >= 200 && resp.statusCode < 300) resolve(parsed);
+                    else reject(new Error(parsed.error ? parsed.error.description : 'RazorpayX API error (status ' + resp.statusCode + ')'));
+                } catch (e) { reject(e); }
+            });
+        });
+        reqStream.on('error', reject);
+        if (payload) reqStream.write(payload);
+        reqStream.end();
+    });
+}
+
+// Contact + Fund Account banao (ya jo pehle se ban chuke hain unhe reuse
+// karo) — is record ko wapas 'hrms_employees'/'agents' mein save kar
+// dete hain taaki dobara-dobara Razorpay par naya contact na banana pade.
+async function ensureRazorpayFundAccount(existingFundAccountId, contactName, contactType, bankAccountName, accountNumber, ifsc) {
+    if (existingFundAccountId) return existingFundAccountId; // already bana hua hai
+    const contact = await razorpayXRequest('POST', '/v1/contacts', {
+        name: contactName, type: contactType // 'employee' ya 'vendor' (agent ke liye)
+    });
+    const fundAccount = await razorpayXRequest('POST', '/v1/fund_accounts', {
+        contact_id: contact.id,
+        account_type: 'bank_account',
+        bank_account: { name: bankAccountName || contactName, ifsc: ifsc, account_number: accountNumber }
+    });
+    return fundAccount.id;
+}
+// Ek payout banata hai — 'reference_id' se IDEMPOTENT hai: agar isi
+// reference_id se pehle se ek payout ban chuka ho, Razorpay dobara
+// naya payout NAHI banata (double-payment se bachne ke liye critical).
+async function createRazorpayPayout(fundAccountId, amountRupees, referenceId, narration) {
+    return razorpayXRequest('POST', '/v1/payouts', {
+        account_number: process.env.RAZORPAYX_ACCOUNT_NUMBER,
+        fund_account_id: fundAccountId,
+        amount: Math.round(Number(amountRupees) * 100), // paise mein
+        currency: 'INR',
+        mode: 'IMPS',
+        purpose: 'payout',
+        queue_if_low_balance: true,
+        reference_id: referenceId,
+        narration: narration || 'Payout'
     });
 }
 
